@@ -115,6 +115,16 @@ Before using this submodule, ensure:
 host. For CCG deployments this is via Tailscale MagicDNS. For other setups, point
 to your taskforge instance's hostname or IP.
 
+**Submodule-first invocation rule:** `setup.sh` (and `/setup-orchestration`) must
+be invoked from inside the target project, with `ccg_project_orchestration`
+already added as a submodule at `orchestration/`. Cross-project invocation —
+running `setup.sh` from one project's checkout (or worktree) with
+`--project-root` pointing at a different project — is unsupported: the symlink
+and `CLAUDE.md` paths it stamps will reference the source project's path on
+disk (often a transient worktree) and break as soon as that source is moved or
+cleaned up. Always add the submodule to the target project first, then run
+`./orchestration/setup.sh --project-root .` from that project's root.
+
 ---
 
 ## How to add as a submodule
