@@ -603,8 +603,8 @@ Read the rest of the task-row contract:
   prompt and PR body simply omit the AC section.
 - `attrs.branch` — optional; defaults to `dev`.
 - `attrs.workflow` — optional; a single workflow `id` string or an
-  ordered list of workflow ids from the library at
-  `${ORCHESTRATION_DIR:-orchestration}/docs/workflows/` (e.g., `"lightweight"`, `"infra-change"`,
+  ordered list of workflow ids from the materialized cache at
+  `.orchestration/workflows/` (e.g., `"lightweight"`, `"infra-change"`,
   `["six-phase-build", "infra-change"]`). If unset (or set to the legacy
   value `"full"`), the orchestrator runs best-fit selection (step
   6b-workflow) which may also auto-chain workflows. See step 6d.
@@ -666,40 +666,42 @@ or blank (after stripping whitespace):
 
 After reading task fields, select one or more coordinator workflows.
 The result is an ordered **workflow chain** (which may contain a single
-entry). The workflow library is served from the taskforge DB
-(`GET /workflows` → `best_for` lists; `GET /workflows/by-slug/{slug}`
-→ `head_version_id`; `GET /workflow-versions/{id}` → `body_template`).
-The filesystem path `${ORCHESTRATION_DIR:-orchestration}/docs/workflows/` is a one-release
-fallback: if the DB returns no match for a slug, `build-coord-prompt.py`
-warns and reads the `.md` file. The schema, selection heuristics, and
-chaining rules are documented in `${ORCHESTRATION_DIR:-orchestration}/docs/workflows/README.md`.
+entry). The materialized cache at `.orchestration/workflows/` (regenerated
+by `/sync-workflow pull`) is the primary source for workflow definitions.
+`build-coord-prompt.py` falls back to the taskforge REST API
+(`GET /workflows/by-slug/{slug}/published`) when a materialized file is
+missing. The schema, selection heuristics, and chaining rules are
+documented in `${ORCHESTRATION_DIR:-orchestration}/docs/workflows/README.md` (architectural
+overview — the DB is the live source, editable via the `/workflows` GUI).
 
 **Step 1 — explicit override.**
 If `attrs.workflow` is set to a non-empty value that is not `"full"`:
 
 - **List value** (e.g., `["six-phase-build", "infra-change"]`): for each
-  id, call `GET /workflows/by-slug/{id}` — fall back to the filesystem
-  file if DB returns 404. Unknown ids (both DB and filesystem miss) →
+  id, call `GET /workflows/by-slug/{id}` — fall back to the
+  `.orchestration/workflows/<id>.md` materialized cache if DB returns 404.
+  Unknown ids (both DB and materialized-file miss) →
   `add_note` warning + skip that entry. The result is an explicit chain.
   Record: `add_note(task_id, 'selected workflow chain: [<ids>] (explicit override)')`.
   Skip steps 2–3.
 - **String value** (e.g., `"infra-change"`): call
-  `GET /workflows/by-slug/{attrs.workflow}` — fall back to filesystem
-  `${ORCHESTRATION_DIR:-orchestration}/docs/workflows/<attrs.workflow>.md` on 404. If both miss,
-  log: `add_note(task_id, 'unknown workflow id "<attrs.workflow>" — falling back to best-fit')`
+  `GET /workflows/by-slug/{attrs.workflow}` — fall back to
+  `.orchestration/workflows/<attrs.workflow>.md` materialized cache on 404.
+  If both miss, log:
+  `add_note(task_id, 'unknown workflow id "<attrs.workflow>" — falling back to best-fit')`
   and fall through to step 2. If found, use it as the primary, then check
   its `chains_with` list (step 2b below). Record:
   `add_note(task_id, 'selected workflow: <id> (explicit override)')`.
 
 **Step 2 — best-fit scoring.**
-Call `GET /workflows?include_unpublished=false` to retrieve all published
-workflow slugs and their `best_for` arrays from the DB. Fall back to
-listing `.md` files in `${ORCHESTRATION_DIR:-orchestration}/docs/workflows/` (excluding `README.md`
-and `DRAFT:*` prefix) if the DB call fails. For each workflow, For each workflow file,
-read its `best_for` list from the YAML frontmatter. Score by counting
-how many `best_for` strings appear (case-insensitive substring match)
-in the task title + description combined, plus any file-path hints in
-the description.
+List `.orchestration/workflows/*.md` (excluding `*.overlay.md`) from the
+materialized cache to retrieve all published workflow slugs and their
+`best_for` arrays. If the materialized cache directory is missing or
+empty, fall back to `GET /workflows?include_unpublished=false`. For each
+workflow, read its `best_for` list from the YAML frontmatter. Score by
+counting how many `best_for` strings appear (case-insensitive substring
+match) in the task title + description combined, plus any file-path hints
+in the description.
 
 Pick the highest-scoring workflow as the **primary**. Ties: prefer the
 workflow with the longer `best_for` list (more specific). If no
@@ -721,25 +723,32 @@ If no auto-chain triggers, record:
 If no workflow scored above 0 AND the task description contains strong
 structural cues that suggest a workflow domain not covered by any
 existing workflow (e.g., "mobile build", "data pipeline sync"):
-1. Author a new workflow file at
-   `${ORCHESTRATION_DIR:-orchestration}/docs/workflows/DRAFT:<slug>.md`. Use the schema in
-   `${ORCHESTRATION_DIR:-orchestration}/docs/workflows/README.md`. Extrapolate phases from the
-   task description.
+1. POST the new workflow to the taskforge DB (all three steps are
+   idempotent via `client_request_id`):
+   - `POST /workflows` `{"slug": "DRAFT:<slug>", "name": "DRAFT: <name>",
+     "client_request_id": "draft-<slug>-<task_id[:8]>"}` → `wf_id`
+   - `POST /workflows/<wf_id>/versions` `{"body_template": "<draft body>",
+     "best_for": [...], "chains_with": [], "phases": [...],
+     "client_request_id": "draft-ver-<slug>-<task_id[:8]>"}` → `version_id`
+   - `POST /workflow-versions/<version_id>/publish`
+     `{"client_request_id": "draft-pub-<slug>-<task_id[:8]>"}`
+   - Run `/sync-workflow pull --slug DRAFT:<slug>` to materialize.
 2. Auto-file a review task:
    ```
    create_task(
      title='Review new workflow draft: <slug>',
-     description='The orchestrator authored a new workflow type at '
-                 '${ORCHESTRATION_DIR:-orchestration}/docs/workflows/DRAFT:<slug>.md to cover '
-                 'task <uuid> ("<title>"). Review and rename to <slug>.md '
-                 'to promote, or delete to discard.',
+     description='The orchestrator authored a new workflow type '
+                 '(DRAFT:<slug>) to cover task <uuid> ("<title>"). '
+                 'Review in the Taskforge /workflows GUI, edit the body, '
+                 'and rename the slug to <slug> to promote, or delete to discard.',
      status='todo',
      assigned_to_id=None,
      category='Orchestration',
      attrs={'kind': 'orchestration-improvement'},
    )
    ```
-3. Use the draft for this run. Record:
+3. Use the materialized `.orchestration/workflows/DRAFT:<slug>.md` for
+   this run. Record:
    `add_note(task_id, 'selected workflow: DRAFT:<slug> (authored at intake)')`.
 
 If score == 0 but there is no strong structural signal for a new domain,
@@ -781,10 +790,9 @@ python3 ${ORCHESTRATION_DIR:-orchestration}/scripts/build-coord-prompt.py \
 Output path defaults to `/tmp/coord-<short-id>.prompt`. The script
 enforces all four-part invariants described below in "Coordinator
 prompt assembly" — Part 0 is always prepended, the leading-dash
-gotcha is guarded by construction, workflow body is fetched from the
-taskforge DB (`GET /workflows/by-slug/{slug}` → `GET /workflow-versions/{id}`
-→ `body_template`) with a filesystem fallback to
-`${ORCHESTRATION_DIR:-orchestration}/docs/workflows/<slug>.md`, and the MCP-first release
+gotcha is guarded by construction, workflow body is read from
+`.orchestration/workflows/<slug>.md` (materialized cache) with a REST API
+fallback to `GET /workflows/by-slug/{slug}/published` on cache miss, and the MCP-first release
 checklist is appended. The script also resolves agent personas
 (`.orchestration/agents/<slug>.md` → DB `GET /agents/{slug}` → stub)
 and pre-stages `/tmp/specialist-{tag}-<short>.persona` files for every
@@ -939,7 +947,7 @@ workflow file(s)):
 **Single workflow (no chain):**
 ```
 --- WORKFLOW INSTRUCTIONS ---
-<verbatim body of ${ORCHESTRATION_DIR:-orchestration}/docs/workflows/<workflow-id>.md,
+<verbatim body of .orchestration/workflows/<workflow-id>.md (materialized cache),
  with {{ task_id }}, {{ worktree_path }}, {{ branch }}, {{ title }},
  {{ description }}, {{ acceptance_criteria }} tokens substituted>
 ```
@@ -1040,9 +1048,9 @@ your RELEASED line.
 ```
 
 The release-checklist trailer is authoritative. Individual workflow
-bodies in `${ORCHESTRATION_DIR:-orchestration}/docs/workflows/*.md` MUST NOT include their own
-release guidance — the trailer is where that lives, so it stays
-consistent across workflows and evolves in one place.
+bodies (in the DB, materialized to `.orchestration/workflows/*.md`) MUST
+NOT include their own release guidance — the trailer is where that lives,
+so it stays consistent across workflows and evolves in one place.
 
 The `cd <worktree-path>` in the tmux launch command ensures the
 coordinator starts in the right directory.

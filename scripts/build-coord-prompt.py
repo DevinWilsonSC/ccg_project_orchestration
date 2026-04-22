@@ -9,8 +9,10 @@ Canonical assembly of the four-part coordinator prompt specified in
           assembled prompt never begins with a dash (`claude -p` would
           parse a leading `-`/`--`/`---` as an option flag and fail).
   Part 1  task-fields block: title, description, AC, plan, tmux window.
-  Part 2  workflow body, verbatim from docs/workflows/<slug>.md,
-          frontmatter stripped, {{ token }} substitution applied.
+  Part 2  workflow body, from .orchestration/workflows/<slug>.md (materialized
+          cache), falling back to the taskforge REST API on miss, then
+          to docs/workflows/<slug>.md (legacy, deprecated).
+          Frontmatter stripped, {{ token }} substitution applied.
   Part 3  mandatory release checklist trailer (prefers MCP tool path,
           curl fallback).
 
@@ -37,12 +39,67 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-WORKFLOWS_DIR = REPO_ROOT / "docs" / "workflows"
+WORKFLOWS_DIR = REPO_ROOT / "docs" / "workflows"  # legacy fallback
+
+
+def _git_root() -> Path:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return Path(out.strip())
+    except Exception:
+        return Path.cwd()
+
+
+def _fetch_workflow_from_api(slug: str, base: str, api_key: str) -> str:
+    """Fetch the published workflow body from the REST API and compose a
+    YAML-frontmatter + body_template string (same format as materialized files)."""
+    headers = {"X-API-Key": api_key}
+
+    def _get(url: str) -> dict:
+        req = urllib.request.Request(url, headers=headers)
+        return json.load(urllib.request.urlopen(req, timeout=10))
+
+    # Try convenience endpoint first (added in WFE-DBSYNC).
+    version: dict | None = None
+    try:
+        version = _get(f"{base}/workflows/by-slug/{slug}/published")
+    except Exception:
+        pass
+
+    if version is None:
+        wf = _get(f"{base}/workflows/by-slug/{slug}")
+        wf_id = wf["id"]
+        versions = _get(f"{base}/workflows/{wf_id}/versions")
+        published = [v for v in versions if v.get("is_published")]
+        if not published:
+            raise SystemExit(f"workflow '{slug}' has no published version in taskforge")
+        version = published[-1]
+        wf_name = wf.get("name", slug)
+        wf_desc = wf.get("description", "")
+    else:
+        wf_name = slug
+        wf_desc = ""
+
+    lines = ["---", f"id: {slug}", f"name: {wf_name}"]
+    if wf_desc:
+        lines.append(f"description: {wf_desc}")
+    for field in ("best_for", "chains_with", "phases"):
+        items = version.get(field) or []
+        if items:
+            lines.append(f"{field}:")
+            lines.extend(f"  - {item}" for item in items)
+    lines.append("---")
+    return "\n".join(lines) + "\n" + version.get("body_template", "")
 
 
 def _resolve_orch_id(base: str, api_key: str) -> str:
@@ -81,8 +138,50 @@ def fetch_task(base: str, api_key: str, task_id: str) -> dict:
     return json.load(urllib.request.urlopen(r, timeout=15))
 
 
-def load_workflow_body(slug: str) -> str:
+def load_workflow_body(
+    slug: str,
+    base: str | None = None,
+    api_key: str | None = None,
+) -> str:
+    """Load a workflow body (frontmatter stripped) using a three-tier lookup.
+
+    1. .orchestration/workflows/<slug>.md  — materialized cache (preferred)
+    2. Taskforge REST API                  — if materialized file missing
+    3. docs/workflows/<slug>.md            — legacy fallback (deprecated)
+    """
+    # Tier 1: materialized cache
+    materialized = _git_root() / ".orchestration" / "workflows" / f"{slug}.md"
+    if materialized.exists():
+        text = materialized.read_text()
+        m = re.match(r"^---\s*\n.*?\n---\s*\n", text, re.DOTALL)
+        return text[m.end():] if m else text
+
+    # Tier 2: REST API
+    if base and api_key:
+        try:
+            text = _fetch_workflow_from_api(slug, base, api_key)
+            print(
+                f"WARNING: {slug}.md not in materialized cache; fetched from API. "
+                "Run `/sync-workflow pull --slug {slug}` to populate the cache.",
+                file=sys.stderr,
+            )
+            m = re.match(r"^---\s*\n.*?\n---\s*\n", text, re.DOTALL)
+            return text[m.end():] if m else text
+        except Exception as exc:
+            print(f"WARNING: API fetch for '{slug}' failed ({exc}); trying legacy path", file=sys.stderr)
+
+    # Tier 3: legacy filesystem (deprecated)
     path = WORKFLOWS_DIR / f"{slug}.md"
+    if not path.exists():
+        raise SystemExit(
+            f"Workflow '{slug}' not found: materialized cache missing, API unavailable, "
+            f"and legacy path '{path}' does not exist."
+        )
+    print(
+        f"WARNING: loading '{slug}' from deprecated path {path}. "
+        "Run `/setup-orchestration` then `/sync-workflow pull --slug {slug}` to migrate.",
+        file=sys.stderr,
+    )
     text = path.read_text()
     m = re.match(r"^---\s*\n.*?\n---\s*\n", text, re.DOTALL)
     return text[m.end():] if m else text
@@ -200,7 +299,7 @@ The orchestrator runs the ship path on the next tick.
 
 
 def build(task: dict, workflow_slug: str, branch: str, worktree: str,
-          base: str, orch_id: str) -> str:
+          base: str, orch_id: str, api_key: str | None = None) -> str:
     short = task["id"][:8]
     window = f"coord-{short}"
     ctx = {
@@ -212,7 +311,7 @@ def build(task: dict, workflow_slug: str, branch: str, worktree: str,
         "acceptance_criteria": task.get("acceptance_criteria") or "",
         "task_id[:8]": short,
     }
-    wf_body = render_workflow(load_workflow_body(workflow_slug), ctx)
+    wf_body = render_workflow(load_workflow_body(workflow_slug, base=base, api_key=api_key), ctx)
     wf_body = wf_body.replace("{{ task_id[:8] }}", short)
     prompt = (
         part0(short, worktree, window)
@@ -250,7 +349,7 @@ def main() -> int:
 
     orch_id = args.actor_id or _resolve_orch_id(args.base, api_key)
     task = fetch_task(args.base, api_key, args.task_id)
-    prompt = build(task, args.workflow, args.branch, args.worktree, args.base, orch_id)
+    prompt = build(task, args.workflow, args.branch, args.worktree, args.base, orch_id, api_key=api_key)
 
     out_path = args.out or f"/tmp/coord-{task['id'][:8]}.prompt"
     Path(out_path).write_text(prompt)
