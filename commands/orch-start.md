@@ -120,10 +120,14 @@ notification:
      REAP branch (3a or 3b) for that single task. The ship-on-status
      fast path may have missed it if the coord released between ticks
      and this is the first signal.
-   - Task's `_coordinator_tmux_window` is already cleared (earlier
-     tick shipped via 3a ship-on-status) → the only remaining work is
-     3c cleanup (rm tempfiles, kill tmux window, remove worktree).
-     Run 3c for this short-id.
+   - Task's `_coordinator_tmux_window` is already cleared → two sub-cases:
+     - `task.status == in_progress` AND `attrs.checkpoint.phases_completed`
+       non-empty (**Resumable** — SIGTERMed by §0a): **skip entirely**.
+       The §0a sequence already handled this; no REAP or 3c action
+       needed. The task will be respawned via TOP UP on the next full tick.
+     - Otherwise (task in terminal status, or not found): the only
+       remaining work is 3c cleanup (rm tempfiles, kill tmux window,
+       remove worktree). Run 3c for this short-id.
    - No matching task found (orphan `.done` from a previous session)
      → run 3c cleanup only.
    The rest of the queue (heartbeat, top-up) is not revisited here —
@@ -258,12 +262,7 @@ effectively disabled (fail-open).
   1. **HEARTBEAT** all in-flight tasks one final time (leases are
      renewed here because the pause will outlast the normal 30-min
      lease — a 5-hour quota window is long).
-  2. **Do NOT kill coordinator tmux windows.** Running coordinators
-     continue independently inside tmux; they don't burn orchestrator
-     quota (they're separate `claude -p` sessions on their own
-     quotas). Their `.done` files accumulate and will be reaped on
-     resume.
-  3. **Pre-pause freshness check.** If `SOURCE=browser`, verify
+  2. **Pre-pause freshness check.** If `SOURCE=browser`, verify
      `RESET_EPOCH` is fresh before committing to a DELAY:
      ```bash
      updated_epoch=$(python3 -c "
@@ -287,21 +286,63 @@ effectively disabled (fail-open).
      If `session-usage-watcher.py --once` fails (Chrome unreachable),
      it exits non-zero but writes nothing; the stale values are used
      rather than blocking the pause.
-  4. **Write the quota-pause state file:**
+  3. **SIGTERM all in-flight coordinator processes.** Coordinators share
+     the orchestrator's Anthropic quota and will be killed at 100%
+     anyway — a controlled SIGTERM is strictly better than an
+     uncontrolled death. Worktrees and tmux windows are preserved;
+     only the `claude -p` processes inside the panes are killed.
+     Track `K` = number of coord windows processed.
+     For each in-flight coord window:
+     ```bash
+     COORD_WINDOW="coord-<short>"
+
+     # Enumerate all pane PIDs (includes specialist split-panes)
+     PANE_PIDS=$(tmux list-panes -t "$COORD_WINDOW" -F '#{pane_pid}' 2>/dev/null || echo "")
+
+     if [ -n "$PANE_PIDS" ]; then
+       # SIGTERM every pane PID and its child tree
+       for PANE_PID in $PANE_PIDS; do
+         pkill -TERM -P "$PANE_PID" 2>/dev/null || true
+         kill -TERM "$PANE_PID" 2>/dev/null || true
+       done
+
+       # Bounded grace period (10 s is enough for claude -p to flush)
+       sleep 10
+
+       # SIGKILL any survivors
+       for PANE_PID in $PANE_PIDS; do
+         pkill -KILL -P "$PANE_PID" 2>/dev/null || true
+         kill -KILL "$PANE_PID" 2>/dev/null || true
+       done
+     fi
+
+     # Touch .done and write exit 99 so Monitor can distinguish
+     # this SIGTERM from a normal completion
+     touch /tmp/coord-<short>.done
+     printf "99\n" > /tmp/coord-<short>.exit
+     ```
+     See `docs/designs/wfe-ckpt-3-respawn.md` §1 for specialist
+     split-pane handling and full rationale.
+  4. **Clear `attrs._coordinator_tmux_window`** for each SIGTERM'd task
+     (one PATCH per task). Clear AFTER processes are dead (step 3) —
+     clearing before kill would mis-classify the task as Resumable/Fresh
+     before SIGTERM completes. This attr being unset is what makes the
+     next tick classify the task as Resumable (if it has a checkpoint)
+     rather than In-flight.
+  5. **Write the quota-pause state file:**
      `echo "$RESET_EPOCH" > /tmp/orch-quota-paused-until`. This ensures
      subsequent chained wakeups enter the minimal-tick path (Guard A)
      instead of re-running the full §0a body.
-  5. Compute wake-up delay. `DELAY = min(3600, max(60,
+  6. Compute wake-up delay. `DELAY = min(3600, max(60,
      (RESET_EPOCH + 60) - $(date +%s)))`. The `+60` buffer waits a
      minute past reset to avoid a race. `ScheduleWakeup` caps delay
      at 3600s, so a reset >1 h away produces a chain of 1-hour
      wakeups — each a minimal-tick (Guard A) that heartbeats leases
      and re-schedules without Telegram noise.
-  6. Telegram: `"⏸ Session quota at <N>% — pausing until reset
-     (~<ETA>). Coordinators continue in tmux; will auto-resume."`
-     **This message is sent exactly once** — chained wakeups skip
-     Telegram via Guard A.
-  7. `ScheduleWakeup(delaySeconds=DELAY, prompt='<<autonomous-loop-dynamic>>',
+  7. Telegram: `"⏸ Session quota at <N>% — pausing. SIGTERMed <K>
+     coordinators; will respawn on resume (~<ETA>)."` **This message
+     is sent exactly once** — chained wakeups skip Telegram via Guard A.
+  8. `ScheduleWakeup(delaySeconds=DELAY, prompt='<<autonomous-loop-dynamic>>',
      reason='quota pause until reset')`. **End the tick here** —
      no further steps run.
 
@@ -323,7 +364,10 @@ available.
   ~<N>% — approaching limit"`. Proceed concisely.
 - **≥90%:** graceful shutdown:
   1. **HEARTBEAT** all currently in-flight tasks one final time.
-  2. **Do NOT kill coordinator tmux windows** (same reasoning as 0a).
+  2. **Do NOT kill coordinator tmux windows.** §0b does NOT SIGTERM
+     coords (unlike §0a). Coord processes are independent of the
+     orchestrator's context window; ending the orchestrator session
+     does not kill them.
   3. Telegram: `"⚠ Orchestrator stopping — context at ~<N>%. Run
      /orch-start in a new session to resume. In-flight coordinators
      continue in their tmux windows."`
@@ -380,16 +424,31 @@ coords that crashed without calling `release_task`.
   `task.status` ∈ {`done`, `blocked`, `waiting_on_human`} AND
   `attrs.completion` is present. Ship immediately (step 3) regardless
   of whether `/tmp/coord-<short-id>.done` exists yet.
-- **Crashed (ship partial):** `_coordinator_tmux_window` is set AND
+- **Crashed (resume or salvage):** `_coordinator_tmux_window` is set AND
   `/tmp/coord-<short-id>.done` exists AND `task.status == in_progress`
   (coord `claude -p` exited without calling `release_task`). Step 3
-  treats this as a release-less failure → partial-ship + mark blocked.
+  applies the checkpoint guard: if `attrs.checkpoint.phases_completed`
+  is non-empty, take the resume path; otherwise fall through to §3b
+  last-resort salvage.
 - **In-flight:** `_coordinator_tmux_window` is set AND neither of the
   above — the coord is still working (or still emitting final output
   after a release that hasn't propagated yet). Heartbeat in step 4.
-- **Fresh:** `_coordinator_tmux_window` is unset, OR the `.done` file
-  and tmux window are both gone (orphan from a previous session). A
-  fresh task joins the top-up candidates in step 5.
+- **Fresh:** `_coordinator_tmux_window` is unset (or both the `.done`
+  file and tmux window are gone) AND (`attrs.checkpoint` is absent OR
+  `attrs.checkpoint.phases_completed` is empty). A fresh task joins
+  the top-up candidates in step 5 for a new coordinator spawn.
+- **Resumable:** `_coordinator_tmux_window` is unset (or the named
+  window no longer exists) AND `attrs.checkpoint.phases_completed` is
+  a non-empty list AND `task.status` is `ready` or `in_progress`.
+  These are coords that were SIGTERMed on quota pause (§0a) or died
+  after writing at least one checkpoint phase. They join the top-up
+  candidates in step 5, walked before the Fresh queue, and are
+  respawned via `build-coord-prompt.py --resume` (see §5, §6d).
+
+Note: the three-query union already covers Resumable tasks —
+`status='in_progress'` (query #2) fetches SIGTERM'd tasks whose leases
+were heartbeated before pause. Resumable vs Fresh is client-side
+classification based on `attrs.checkpoint.phases_completed`.
 
 Orphan handling: a task whose `_coordinator_tmux_window` points to a
 tmux window that no longer exists (because the previous orchestrator
@@ -442,12 +501,32 @@ For every task classified as **Released** in step 2 (terminal status
    and the window get swept by step 3c below once the `.done` marker
    appears.
 
-#### 3b. Crashed bucket (partial-ship + mark blocked)
+#### 3b. Crashed bucket — checkpoint guard, then last-resort salvage
 
-For every task classified as **Crashed** in step 2 (`/tmp/coord-<short-id>.done`
-exists AND `task.status == in_progress`):
+For every task classified as **Crashed** in step 2 (`_coordinator_tmux_window`
+set AND `/tmp/coord-<short-id>.done` exists AND `task.status == in_progress`):
 
-The coord exited without calling `release_task`. Read the first 500
+**First: re-fetch the task and check `attrs.checkpoint.phases_completed`.**
+
+- **Non-empty** — coord checkpointed at least once. Take the **resume path**:
+  1. DO NOT call `release_task`. Task stays `in_progress`.
+  2. Clear `attrs._coordinator_tmux_window` (PATCH).
+  3. Partial cleanup: `rm -f /tmp/coord-<short>.prompt /tmp/coord-<short>.exit`;
+     rename `/tmp/coord-<short>.log → /tmp/coord-<short>.log.prev`.
+     DO NOT remove the worktree. DO NOT `rm /tmp/coord-<short>.done`
+     (Monitor already fired; the next respawn's stale-sidecar cleanup in
+     §6d Step 1 sweeps it before relaunch).
+  4. `add_note(task, "coord died after phases_completed=<list> — resume queued for next tick (will respawn from <checkpoint.current_phase>)")`.
+  5. Telegram: `"♻ <short> died after <phases_completed[-1]> — will resume next tick from <checkpoint.current_phase>"`.
+  6. DO NOT partial-ship. DO NOT file a self-improvement task (this is expected behavior, not a prompt bug).
+  7. Done — next tick classifies this task as Resumable and respawns it via `--resume`.
+
+- **Empty or absent** — coord died before any checkpoint. Fall through to
+  last-resort salvage below.
+
+**Last-resort salvage** (applies ONLY when `checkpoint` is absent OR
+`phases_completed` is empty). The coord exited without calling
+`release_task` and without a usable checkpoint. Read the first 500
 chars of `/tmp/coord-<short-id>.log` for diagnostic context. Then:
 
 1. `add_note(<task>, "coord exited without release_task — treating as
@@ -471,17 +550,25 @@ has `_coordinator_tmux_window` set to `coord-<short-id>`:
 
 - **Yes** — the window attr wasn't cleared (shouldn't happen after
   3a/3b but be defensive). Skip.
-- **No** — this is a stale coord that's already been reaped. Clean up:
-  ```bash
-  rm -f /tmp/coord-<short-id>.{prompt,log,exit,done}
-  rm -f /tmp/specialist-*-<short-id>.{prompt,log,persona,done}
-  tmux kill-window -t "coord-<short-id>" 2>/dev/null || true
-  git worktree remove --force .worktrees/task-<short-id> 2>/dev/null || true
-  ```
+- **No** — coord has been reaped or is Resumable. Re-fetch the task
+  and branch:
+  - `task.status == in_progress` AND `attrs.checkpoint.phases_completed`
+    non-empty (**Resumable**): skip worktree removal and `.done` removal
+    — the worktree is needed for respawn on the next tick. Optionally
+    `rm -f /tmp/coord-<short-id>.{prompt,exit}` if the §3b resume path
+    did not already do so.
+  - Otherwise (task in terminal status or not found): full cleanup:
+    ```bash
+    rm -f /tmp/coord-<short-id>.{prompt,log,exit,done}
+    rm -f /tmp/specialist-*-<short-id>.{prompt,log,persona,done}
+    tmux kill-window -t "coord-<short-id>" 2>/dev/null || true
+    git worktree remove --force .worktrees/task-<short-id> 2>/dev/null || true
+    ```
 
 This means a coord reaped via 3a ship-on-status (before `.done` was
 written) has its tempfiles swept on whichever later tick sees the
-`.done` appear — usually within one tick.
+`.done` appear — usually within one tick. Resumed coords skip the
+full sweep until the second coordinator finishes and releases.
 
 ### 4. HEARTBEAT still-in-flight tasks
 
@@ -499,13 +586,37 @@ in ≤30 min and the lease-sweeper reverts the tasks to TODO.
 Count current in-flight tasks (from step 2, post-reap). Let
 `SLOTS = max(0, 10 - <in_flight_count>)`. If `SLOTS == 0`, skip to step 8.
 
-Walk the fresh queue in oldest-`updated_at` order. For each candidate,
-run step 5a (dependency gating) first. If the candidate is **eligible**,
-run steps 6a–6d. If **deferred**, move to the next candidate. Stop once
-SLOTS eligible candidates have been spawned or the queue is exhausted.
+Split the §2 candidates into two sub-queues:
+- **Resumable queue**: tasks classified Resumable, sorted oldest-`updated_at`
+  first. Walked **first** — they already consumed quota and their partial
+  work is valuable.
+- **Fresh queue**: tasks classified Fresh (no usable checkpoint). Walked
+  **second**, unchanged behavior.
 
-If after this the queue is still non-empty (more fresh tasks than
-slots), the remaining ones simply wait — next tick will top up again.
+**Walk the Resumable queue first.**
+`HEADROOM = int(os.environ.get("ORCH_RESUME_USAGE_HEADROOM", 75))` (default 75).
+For each resumable candidate, run step 5a (dependency gating). If eligible:
+
+```
+if USAGE_PERCENT >= HEADROOM:
+    add_note(candidate, f"deferred resume: USAGE_PERCENT={USAGE_PERCENT}% >= headroom={HEADROOM}% — will retry next tick")
+    pending_resume_count += 1
+    continue  # do NOT consume a SLOT
+# proceed with resumable spawn via steps 6a–6d (--resume path; see §6d)
+SLOTS -= 1
+if SLOTS == 0:
+    break
+```
+
+If `SLOTS == 0` after the Resumable walk, skip to step 8.
+
+**Walk the Fresh queue second.** For each candidate, run step 5a
+(dependency gating). If the candidate is **eligible**, run steps 6a–6d.
+If **deferred**, move to the next candidate. Stop once SLOTS eligible
+candidates have been spawned or the queue is exhausted.
+
+If after this the queue is still non-empty (more tasks than slots),
+the remaining ones simply wait — next tick will top up again.
 Deferred tasks also wait for next tick.
 
 If the queue returns zero in-flight AND zero fresh tasks for **3
@@ -776,9 +887,33 @@ Telegram: `"🌱 Worktree ready for <short-id> at <path>"`.
 Telegram: `"▶ Starting <short-id> \"<title>\" (repo=<repo_path>, branch=task/..., workflow=<workflow-id>)"`.
 Telegram: `"🧠 Delegating <short-id> to <workflow-name> coordinator"`.
 
-**Step 1 — Build the coordinator prompt.** Run the canonical assembler
-script; do NOT re-implement assembly inline or via ad-hoc `/tmp/` scripts:
+**Step 1 — Pre-launch prep and prompt build.**
 
+**Resumable tasks only — stale sidecar cleanup** (do this before building
+the prompt, to prevent the Monitor from re-firing the old `.done` event):
+```bash
+rm -f /tmp/coord-<short>.done
+rm -f /tmp/coord-<short>.exit
+[ -f /tmp/coord-<short>.log ] && mv /tmp/coord-<short>.log /tmp/coord-<short>.log.prev
+```
+
+**Resumable tasks only — worktree existence check** (the worktree was
+preserved on SIGTERM; §6c creates worktrees for fresh tasks):
+```bash
+WORKTREE_PATH=<repo_path>/.worktrees/task-<short>
+if [ ! -d "$WORKTREE_PATH" ]; then
+  # Defensive: worktree pruned manually — recreate from origin/dev
+  cd <repo_path>
+  git fetch origin dev
+  git worktree add -b task/<short>-<slug> "$WORKTREE_PATH" origin/dev
+  # add_note(task, "resumable: worktree was absent — recreated from origin/dev")
+fi
+```
+
+**Build the coordinator prompt.** Run the canonical assembler script;
+do NOT re-implement assembly inline or via ad-hoc `/tmp/` scripts.
+
+*Fresh task:*
 ```bash
 python3 ${ORCHESTRATION_DIR:-orchestration}/scripts/build-coord-prompt.py \
   --task-id <short-or-full> \
@@ -786,6 +921,19 @@ python3 ${ORCHESTRATION_DIR:-orchestration}/scripts/build-coord-prompt.py \
   --branch task/<short>-<slug> \
   --worktree <worktree-path>
 ```
+
+*Resumable task (adds `--resume`; workflow from checkpoint, NOT re-scored):*
+```bash
+python3 ${ORCHESTRATION_DIR:-orchestration}/scripts/build-coord-prompt.py \
+  --task-id <short-or-full> \
+  --workflow <attrs.checkpoint.workflow> \
+  --branch task/<short>-<slug> \
+  --worktree <worktree-path> \
+  --resume
+```
+`--workflow` for resumable tasks MUST be `attrs.checkpoint.workflow` (the
+checkpoint's recorded workflow), NOT `attrs.workflow` — re-scoring could
+pick a different workflow, which `_validate_resume` would reject anyway.
 
 Output path defaults to `/tmp/coord-<short-id>.prompt`. The script
 enforces all four-part invariants described below in "Coordinator
@@ -836,7 +984,9 @@ orchestration-improvement task (§9) so the workflow body can tighten
 its delegation language. Do not respond by forcing the task to opus.
 
 **Step 2 — Launch via tmux.** Use Bash to run, substituting `${MODEL}`
-per the rule above:
+per the rule above.
+
+*Fresh task (existing):*
 ```bash
 tmux new-window -d -n "coord-<short-id>" \
   "cd <worktree-path> && \
@@ -844,6 +994,31 @@ tmux new-window -d -n "coord-<short-id>" \
    echo \$? > /tmp/coord-<short-id>.exit; \
    touch /tmp/coord-<short-id>.done"
 ```
+
+*Resumable task (reuse existing window slot via `respawn-window -k`):*
+```bash
+COORD_WINDOW="coord-<short-id>"
+if tmux has-window -t "$COORD_WINDOW" 2>/dev/null; then
+  tmux respawn-window -k -t "$COORD_WINDOW" \
+    "cd <worktree-path> && \
+     script -qefc 'claude -p \"\$(cat /tmp/coord-<short-id>.prompt)\" --model ${MODEL} \
+       --dangerously-skip-permissions --max-budget-usd 10 --no-session-persistence' \
+       /tmp/coord-<short-id>.log; \
+     echo \$? > /tmp/coord-<short-id>.exit; \
+     touch /tmp/coord-<short-id>.done"
+else
+  # Window was manually killed — create fresh slot
+  tmux new-window -d -n "$COORD_WINDOW" \
+    "cd <worktree-path> && \
+     script -qefc 'claude -p \"\$(cat /tmp/coord-<short-id>.prompt)\" --model ${MODEL} \
+       --dangerously-skip-permissions --max-budget-usd 10 --no-session-persistence' \
+       /tmp/coord-<short-id>.log; \
+     echo \$? > /tmp/coord-<short-id>.exit; \
+     touch /tmp/coord-<short-id>.done"
+fi
+```
+`tmux respawn-window -k` kills the dead panes from the prior coord run
+and starts a fresh shell in the same `coord-<short-id>` window slot.
 
 **Why `script(1)`:** piping `claude -p` output to a file (`> FILE 2>&1`) causes full-buffered stdio — nothing reaches disk until the session exits, and nothing appears in the tmux pane either. `script -qefc '<cmd>' <log>` allocates a pseudo-tty for the child, so Node's line-buffering kicks in; the output streams to both the log file AND the tmux pane in real time. That makes fanouts observable: `tmux attach -t orch`, then `C-b n` to cycle windows — each coordinator window shows its live output, and any specialists the coordinator spawns show in split-panes within that window. `-q` suppresses script's own banner, `-e` propagates the child's exit code (captured by `$?` in the wrapper), `-f` flushes on every write.
 
@@ -1217,7 +1392,7 @@ reply.
 ScheduleWakeup(
   delaySeconds=1200,
   prompt='<<autonomous-loop-dynamic>>',
-  reason='tick complete — reaped R, heartbeat H, launched L, deferred D, auto-queued Q; now I in-flight; next poll in 20m'
+  reason='tick complete — reaped R, heartbeat H, launched L (fresh=F resume=Rs), deferred D (fresh=DF resume=DR headroom=<N>%), auto-queued Q; now I in-flight; next poll in 20m'
 )
 ```
 
