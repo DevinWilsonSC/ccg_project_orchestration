@@ -5,9 +5,10 @@ Canonical assembly of the four-part coordinator prompt specified in
 `.claude/commands/orch-start.md` §6d:
 
   Part 0  single-turn session guidance (anti-ScheduleWakeup, tmux -t,
-          shell-poll pattern). ALWAYS prepended. Starts with "# " so the
-          assembled prompt never begins with a dash (`claude -p` would
-          parse a leading `-`/`--`/`---` as an option flag and fail).
+          shell-poll pattern, checkpoint discipline). ALWAYS prepended.
+          Starts with "# " so the assembled prompt never begins with a
+          dash (`claude -p` would parse a leading `-`/`--`/`---` as an
+          option flag and fail).
   Part 1  task-fields block: title, description, AC, plan, tmux window.
   Part 2  workflow body, from .orchestration/workflows/<slug>.md (materialized
           cache), falling back to the taskforge REST API on miss, then
@@ -19,7 +20,7 @@ Canonical assembly of the four-part coordinator prompt specified in
 Usage:
   python3 scripts/build-coord-prompt.py --task-id <uuid-or-short> \\
       --workflow six-phase-build --branch task/<short>-<slug> \\
-      --worktree /path/to/.worktrees/task-<short> [--out <path>]
+      --worktree /path/to/.worktrees/task-<short> [--out <path>] [--resume]
 
 Defaults:
   --out defaults to /tmp/coord-<short>.prompt
@@ -199,7 +200,7 @@ def render_workflow(body: str, ctx: dict[str, str]) -> str:
     return body
 
 
-def part0(short: str, worktree: str, window: str) -> str:
+def part0(task_id: str, short: str, worktree: str, window: str) -> str:
     return f"""# CRITICAL: SINGLE-TURN SESSION — DO NOT EXIT MID-WORKFLOW
 
 You are running inside `claude -p`, which is a **single-turn session**. There is
@@ -237,6 +238,14 @@ tmux split-pane -d -h -t "{window}" \\
   "cd {worktree} && script -qefc '<launch cmd>' <log>; touch <done-file>"
 ```
 
+CRITICAL — Checkpoint discipline:
+At the VERY START of every phase — before spawning any specialist or writing any file —
+run the checkpoint helper as your first Bash tool call:
+  python3 scripts/checkpoint_phase.py "{task_id}" "<PHASE_NAME>"
+where <PHASE_NAME> matches the phase heading label exactly (e.g. DESIGN, BUILD, INTEGRATE).
+If the command exits non-zero: call add_note with the stderr output, then release(blocked).
+NEVER skip this call — it is what enables safe resume if this session is interrupted.
+
 """
 
 
@@ -263,6 +272,62 @@ def part1(task: dict, worktree: str, branch: str, window: str) -> str:
     if plan:
         out += ["Plan:", plan, ""]
     return "\n".join(out)
+
+
+def _validate_resume(task: dict, workflow_slug: str) -> dict:
+    attrs = task.get("attrs") or {}
+    ckpt = attrs.get("checkpoint")
+
+    if not ckpt:
+        print(
+            f"ERROR: --resume requires attrs.checkpoint but task {task['id']} has none. "
+            "Run without --resume to start fresh.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    current_phase = ckpt.get("current_phase") or ""
+    if not current_phase:
+        print(
+            "ERROR: attrs.checkpoint.current_phase is empty — cannot determine resume point.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    ckpt_wf = ckpt.get("workflow") or ""
+    if ckpt_wf and ckpt_wf != workflow_slug:
+        print(
+            f"ERROR: checkpoint workflow {ckpt_wf!r} does not match --workflow {workflow_slug!r}. "
+            f"Use --workflow {ckpt_wf!r} to resume correctly.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return ckpt
+
+
+def _resume_part1_block(ckpt: dict) -> str:
+    return (
+        "\n**RESUMING WORKFLOW**\n"
+        "This coordinator session is RESUMING from a previous interrupted run.\n"
+        f"- Workflow: {ckpt.get('workflow', '')}\n"
+        f"- Phases completed: {ckpt.get('phases_completed', [])}\n"
+        f"- Current phase (resume here): {ckpt['current_phase']}\n"
+        "\n"
+        "Before doing anything else: run `git status` and `git log --oneline -10` to\n"
+        "assess partial progress from the previous session. Replay `current_phase` from\n"
+        "the beginning — do NOT repeat any phase listed in `phases_completed`.\n"
+    )
+
+
+def _resume_part2_banner(ckpt: dict) -> str:
+    return (
+        f">>> RESUME POINT <<<\n"
+        f"Enter at phase \"{ckpt['current_phase']}\". Phases {ckpt.get('phases_completed', [])} are already done —\n"
+        f"do not re-execute them. Find the heading matching \"{ckpt['current_phase']}\" below and\n"
+        f"start from there.\n"
+        "---\n\n"
+    )
 
 
 def part3(task_id: str, base: str, orch_id: str) -> str:
@@ -299,7 +364,8 @@ The orchestrator runs the ship path on the next tick.
 
 
 def build(task: dict, workflow_slug: str, branch: str, worktree: str,
-          base: str, orch_id: str, api_key: str | None = None) -> str:
+          base: str, orch_id: str, api_key: str | None = None,
+          resume: bool = False) -> str:
     short = task["id"][:8]
     window = f"coord-{short}"
     ctx = {
@@ -313,9 +379,17 @@ def build(task: dict, workflow_slug: str, branch: str, worktree: str,
     }
     wf_body = render_workflow(load_workflow_body(workflow_slug, base=base, api_key=api_key), ctx)
     wf_body = wf_body.replace("{{ task_id[:8] }}", short)
+
+    p1 = part1(task, worktree, branch, window)
+
+    if resume:
+        ckpt = _validate_resume(task, workflow_slug)
+        p1 = p1 + _resume_part1_block(ckpt)
+        wf_body = _resume_part2_banner(ckpt) + wf_body
+
     prompt = (
-        part0(short, worktree, window)
-        + part1(task, worktree, branch, window)
+        part0(task["id"], short, worktree, window)
+        + p1
         + "--- WORKFLOW INSTRUCTIONS ---\n"
         + wf_body
         + part3(task["id"], base, orch_id)
@@ -341,6 +415,8 @@ def main() -> int:
         "TASKFORGE_BASE_URL", "http://taskforge-prod:8000"))
     ap.add_argument("--actor-id", default=None,
                     help="claude_orch actor UUID (overrides CLAUDE_ORCH_ACTOR_ID env var)")
+    ap.add_argument("--resume", action="store_true", default=False,
+                    help="resume from an interrupted workflow run (requires attrs.checkpoint)")
     args = ap.parse_args()
 
     api_key = os.environ.get("TASKFORGE_API_KEY")
@@ -349,7 +425,8 @@ def main() -> int:
 
     orch_id = args.actor_id or _resolve_orch_id(args.base, api_key)
     task = fetch_task(args.base, api_key, args.task_id)
-    prompt = build(task, args.workflow, args.branch, args.worktree, args.base, orch_id, api_key=api_key)
+    prompt = build(task, args.workflow, args.branch, args.worktree, args.base, orch_id,
+                   api_key=api_key, resume=args.resume)
 
     out_path = args.out or f"/tmp/coord-{task['id'][:8]}.prompt"
     Path(out_path).write_text(prompt)
