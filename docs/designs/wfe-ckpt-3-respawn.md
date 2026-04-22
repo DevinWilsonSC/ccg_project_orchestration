@@ -392,10 +392,12 @@ The Monitor fires `COORD_DONE <short>` on any `.done` file appearance — includ
 SIGTERM-triggered `touch /tmp/coord-<short>.done` from §1 above. The orchestrator must
 distinguish:
 
-- SIGTERM'd on pause → `.done` appears AND task `attrs._coordinator_tmux_window` was
-  already cleared (by the SIGTERM sequence, which clears the attr before touching `.done`).
-  On re-fetch the task has no window attr. Classification: skip — no REAP action needed,
-  the SIGTERM sequence already handled it.
+- SIGTERM'd on pause → `.done` appears AND task `attrs._coordinator_tmux_window` is
+  cleared. The SIGTERM sequence touches `.done` first (step 3), then clears the attr
+  (step 4). The Monitor fires on `.done` appearance but the COORD_DONE event is
+  processed at the START of the next scheduled tick — by that point the attr-clear
+  PATCH has already completed. On re-fetch the task has no window attr.
+  Classification: skip — no REAP action needed, the SIGTERM sequence already handled it.
 - True crash → `.done` appears AND window attr is still set (coord died without the
   orchestrator's SIGTERM). Classification: run the decision tree above.
 

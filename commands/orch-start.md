@@ -289,9 +289,10 @@ effectively disabled (fail-open).
   3. **SIGTERM all in-flight coordinator processes.** Coordinators share
      the orchestrator's Anthropic quota and will be killed at 100%
      anyway — a controlled SIGTERM is strictly better than an
-     uncontrolled death. Worktrees and tmux windows are preserved;
-     only the `claude -p` processes inside the panes are killed.
-     Track `K` = number of coord windows processed.
+     uncontrolled death. Worktrees are preserved in all cases. The
+     tmux window is conditionally preserved — only if the coord has a
+     checkpoint (see below). Track `K` = number of coord windows
+     processed.
      For each in-flight coord window:
      ```bash
      COORD_WINDOW="coord-<short>"
@@ -316,10 +317,22 @@ effectively disabled (fail-open).
        done
      fi
 
-     # Touch .done and write exit 99 so Monitor can distinguish
-     # this SIGTERM from a normal completion
-     touch /tmp/coord-<short>.done
-     printf "99\n" > /tmp/coord-<short>.exit
+     # Conditional window preservation (M3): preserve window only if
+     # the coord has a checkpoint — next tick will classify it Resumable
+     # and use respawn-window -k. If no checkpoint, the task re-spawns
+     # Fresh; kill the stale window now so tmux new-window succeeds on
+     # next tick. Also skip .done/.exit for no-checkpoint coords — the
+     # Monitor does not need a synthetic event for a task re-entering
+     # the Fresh queue from scratch.
+     HAS_CKPT=$(echo "$TASK_JSON" | jq -r 'if (.attrs.checkpoint.phases_completed // []) | length > 0 then "true" else "false" end')
+     if [ "$HAS_CKPT" = "true" ]; then
+       # Preserve window for respawn-window -k on resume
+       touch /tmp/coord-<short>.done
+       printf "99\n" > /tmp/coord-<short>.exit
+     else
+       # No checkpoint — Fresh respawn on next tick; kill stale window
+       tmux kill-window -t "$COORD_WINDOW" 2>/dev/null || true
+     fi
      ```
      See `docs/designs/wfe-ckpt-3-respawn.md` §1 for specialist
      split-pane handling and full rationale.
@@ -444,6 +457,12 @@ coords that crashed without calling `release_task`.
   after writing at least one checkpoint phase. They join the top-up
   candidates in step 5, walked before the Fresh queue, and are
   respawned via `build-coord-prompt.py --resume` (see §5, §6d).
+
+Note (N2 — tiebreaker): a task with `_coordinator_tmux_window` set
+AND the named window still alive is **In-flight** even if
+`attrs.checkpoint.phases_completed` is non-empty — the checkpoint is
+advisory while the coord is alive. Resumable status fires only after
+the attr is cleared (by §0a SIGTERM or by crash-with-checkpoint in §3).
 
 Note: the three-query union already covers Resumable tasks —
 `status='in_progress'` (query #2) fetches SIGTERM'd tasks whose leases
@@ -922,18 +941,60 @@ python3 ${ORCHESTRATION_DIR:-orchestration}/scripts/build-coord-prompt.py \
   --worktree <worktree-path>
 ```
 
+*Resumable task — workflow version guard (M2):*
+Before invoking `build-coord-prompt.py --resume`, verify that the
+checkpoint's recorded `workflow_version` matches `attrs.workflow_version_id`.
+A mismatch means the task's workflow definition changed since the checkpoint
+was written — `--resume` would be rejected by `_validate_resume` and the
+task would loop infinitely (stays Resumable, Step 1 fails, next tick
+retries). Detect and block it here instead:
+
+```bash
+CKPT_WF_VERSION=$(echo "$TASK_JSON" | jq -r '.attrs.checkpoint.workflow_version // ""')
+TASK_WF_VERSION=$(echo "$TASK_JSON" | jq -r '.attrs.workflow_version_id // ""')
+if [ -n "$CKPT_WF_VERSION" ] && [ -n "$TASK_WF_VERSION" ] && \
+   [ "$CKPT_WF_VERSION" != "$TASK_WF_VERSION" ]; then
+  add_note(task, "checkpoint workflow_version $CKPT_WF_VERSION != \
+    attrs.workflow_version_id $TASK_WF_VERSION — blocking, cannot auto-resume")
+  release_task('blocked')
+  # partial-ship: push branch + open PR, skip auto-merge
+  Telegram: "⚠ <short> checkpoint/workflow version mismatch — cannot \
+    auto-resume. Review + unblock or requeue."
+  continue  # skip spawn for this task
+fi
+```
+
 *Resumable task (adds `--resume`; workflow from checkpoint, NOT re-scored):*
 ```bash
+PROMPT_BUILD_STDERR=$(mktemp)
 python3 ${ORCHESTRATION_DIR:-orchestration}/scripts/build-coord-prompt.py \
   --task-id <short-or-full> \
   --workflow <attrs.checkpoint.workflow> \
   --branch task/<short>-<slug> \
   --worktree <worktree-path> \
-  --resume
+  --resume 2>"$PROMPT_BUILD_STDERR"
+PROMPT_BUILD_EXIT=$?
+if [ $PROMPT_BUILD_EXIT -ne 0 ]; then
+  STDERR_TAIL=$(tail -5 "$PROMPT_BUILD_STDERR")
+  rm -f "$PROMPT_BUILD_STDERR"
+  add_note(task, "build-coord-prompt.py --resume exited $PROMPT_BUILD_EXIT: $STDERR_TAIL")
+  Telegram: "⚠ <short> build-coord-prompt.py failed (exit $PROMPT_BUILD_EXIT) — skipping spawn. Check note."
+  continue  # do NOT block — failure may be transient; task stays Resumable
+fi
+rm -f "$PROMPT_BUILD_STDERR"
 ```
 `--workflow` for resumable tasks MUST be `attrs.checkpoint.workflow` (the
 checkpoint's recorded workflow), NOT `attrs.workflow` — re-scoring could
 pick a different workflow, which `_validate_resume` would reject anyway.
+
+*Fresh task — non-zero exit handler:*
+Similarly, if `build-coord-prompt.py` (the fresh invocation) exits non-zero:
+```bash
+# Wrap fresh invocation the same way; on failure:
+add_note(task, "build-coord-prompt.py exited $EXIT: $STDERR_TAIL")
+Telegram: "⚠ <short> build-coord-prompt.py failed (exit $EXIT) — skipping spawn."
+continue  # task stays Fresh; retry next tick
+```
 
 Output path defaults to `/tmp/coord-<short-id>.prompt`. The script
 enforces all four-part invariants described below in "Coordinator
@@ -1336,15 +1397,21 @@ In the worktree:
 
 ### 8. Idle check
 
-If step 2 classified **zero in-flight AND zero fresh** tasks this tick,
-increment an internal `idle_ticks` counter. After 3 consecutive empty
-ticks, stop the loop (do not reschedule) and Telegram-notify:
+If step 2 classified **zero in-flight AND zero fresh AND zero
+pending-resume** tasks this tick, increment an internal `idle_ticks`
+counter. After 3 consecutive empty ticks, stop the loop (do not
+reschedule) and Telegram-notify:
 `"💤 Orchestrator idle 3 ticks; pausing. Run /orch-start to resume."`
 
 A tick where every fresh candidate was **deferred** by dependency
 gating is **not** idle — work is legitimately queued, it just can't
 start until blockers drain. Deferred-only ticks reset `idle_ticks` to
 0. Same for ticks that auto-queued at least one blocker.
+
+A tick where all Resumable candidates were **deferred by the
+`ORCH_RESUME_USAGE_HEADROOM` gate** (usage too high to safely respawn)
+is likewise **not** idle — those tasks are pending work blocked only
+by quota pressure. Deferred-resumable ticks reset `idle_ticks` to 0.
 
 Any non-empty tick resets `idle_ticks` to 0.
 

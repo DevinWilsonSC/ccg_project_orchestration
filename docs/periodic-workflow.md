@@ -259,12 +259,17 @@ that occurs when `RESET_EPOCH` is more than 3600s away.
      the orchestrator's Anthropic quota and will be killed at 100% anyway
      — a controlled SIGTERM preserves partial work for resume. For each
      in-flight coord: enumerate pane PIDs via `tmux list-panes -F
-     '#{pane_pid}'`, SIGTERM + 10 s grace + SIGKILL survivors, touch
-     `.done` + write `99` to `.exit`. See `orch-start.md §0a` for the
-     exact bash. Worktrees and tmux windows are preserved.
+     '#{pane_pid}'`, SIGTERM + 10 s grace + SIGKILL survivors. Worktrees
+     are preserved in all cases. The tmux window is conditionally
+     preserved: if the coord has a checkpoint (`phases_completed` non-empty),
+     preserve the window (for `respawn-window -k` on resume) and write
+     `.done` + exit `99`; otherwise kill the window with `tmux kill-window`
+     and skip `.done`/`.exit` so Fresh top-up can use `tmux new-window`
+     cleanly on the next tick. See `orch-start.md §0a` for the exact bash.
   4. Clear `attrs._coordinator_tmux_window` for each SIGTERM'd task
      (one PATCH per task, AFTER processes are dead). This makes the next
-     tick classify the task as Resumable rather than In-flight.
+     tick classify the task as Resumable (checkpoint present) or Fresh
+     (no checkpoint) rather than In-flight.
   5. Write `RESET_EPOCH` to `/tmp/orch-quota-paused-until`.
   6. Compute `DELAY = min(3600, max(60, RESET_EPOCH + 60 - now))`.
   7. Telegram: `"⏸ Session quota at N% — pausing. SIGTERMed K
@@ -347,7 +352,11 @@ and shippable. Route on this signal:
   `attrs.checkpoint.phases_completed` non-empty, `task.status ∈
   {ready, in_progress}`. Joins top-up candidates in §4c with priority
   over Fresh tasks. Respawned via `build-coord-prompt.py --resume
-  --workflow <checkpoint.workflow>` (see `orch-start.md` §6d).
+  --workflow <checkpoint.workflow>` (see `orch-start.md` §6d). Before
+  invoking `--resume`, a workflow version guard checks
+  `attrs.checkpoint.workflow_version` vs `attrs.workflow_version_id`;
+  on mismatch the task is blocked with a partial-ship PR instead of
+  entering an infinite respawn loop (see `orch-start.md` §6d, M2).
 
 Post-reap cleanup: after all released/crashed tasks are handled, sweep
 `/tmp/coord-*.done` files whose corresponding tasks no longer have
@@ -936,7 +945,9 @@ The loop stops (does not `ScheduleWakeup`) when:
 - Context usage ≥95% (step 0 context gate — heartbeats in-flight tasks
   before stopping so leases survive until a new session picks up).
 - Auth check fails (`whoami != claude_orch`).
-- 3 consecutive empty ticks (idle pause).
+- 3 consecutive empty ticks (idle pause — zero in-flight, zero fresh,
+  zero pending-resume; deferred-Resumable ticks are not empty and reset
+  the counter).
 - Owner invokes `/orch-stop`.
 - User manually intervenes in-session.
 
