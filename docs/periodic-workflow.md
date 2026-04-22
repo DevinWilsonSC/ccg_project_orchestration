@@ -75,6 +75,24 @@ change — do not let them drift.
   selected, enabling checkpoint freshness verification without parsing
   the nested `checkpoint` object. See `docs/attrs-conventions.md`.
 
+**v6 changes (vs v5):**
+- **Quota-pause now SIGTERMs in-flight coords.** Coordinators share the
+  orchestrator's Anthropic quota and die uncontrollably at 100% anyway —
+  a controlled SIGTERM on §0a pause preserves partial work for resume.
+  Worktrees and tmux windows are preserved; only the `claude -p` processes
+  are killed.
+- **Resumable bucket.** A new §2 classification for `in_progress` tasks
+  with no live coord window and a non-empty `attrs.checkpoint.phases_completed`.
+  These are coords that were SIGTERMed on pause or died after writing at
+  least one checkpoint phase.
+- **Top-up walks Resumable queue first** with an `ORCH_RESUME_USAGE_HEADROOM`
+  gate (default 75%). Resumable tasks get priority over fresh tasks — they
+  already consumed quota and their partial work is valuable. Coordinator is
+  respawned via `build-coord-prompt.py --resume --workflow <checkpoint.workflow>`.
+- **REAP distinguishes crash-with-checkpoint (resume path) from
+  crash-without-checkpoint (§3b last-resort salvage).** The salvage path is
+  retained as a fallback for pre-checkpoint failures only.
+
 **Related:**
 - `ccg/orchestration.md` — top-level orchestrator runtime rules.
 - `agile_tracker/CLAUDE.md` — six-phase workflow + agent team.
@@ -112,6 +130,14 @@ This is deliberate: predictability outranks throughput.
 claiming a `ready` task via `claim_task` (or the TOP-UP step) automatically
 transitions it to `in_progress`. This means `in_progress` always means
 "actively being worked on" — never "please pick this up".
+
+**Resumable tasks (`in_progress` + checkpoint + no window).** An
+`in_progress` task with `attrs.checkpoint.phases_completed` non-empty and
+no live `_coordinator_tmux_window` is classified Resumable in §4a and
+picked up for respawn during TOP UP (§4c), not released. This applies only
+to tasks the orchestrator itself claimed — it never touches `in_progress`
+tasks assigned to other actors. The "predictability outranks throughput"
+rule is preserved: the orchestrator only acts on what it owns.
 
 **Dependency gating.** `ready` is necessary but not sufficient — a
 candidate is also gated on its blockers (`get_dependencies`). If any
@@ -222,19 +248,33 @@ that occurs when `RESET_EPOCH` is more than 3600s away.
 - **≥ 94%:**
   1. Heartbeat all in-flight tasks (one-time lease renewal before the
      long pause).
-  2. Do NOT kill coordinator tmux windows.
-  3. **Pre-pause freshness check.** If `SOURCE=browser` and
+  2. **Pre-pause freshness check.** If `SOURCE=browser` and
      `updated_epoch` in `/tmp/orch-session-usage.json` is >90s old,
      run `python3 scripts/session-usage-watcher.py --once` to force a
      fresh CDP poll, then re-read via `session-usage-check.sh`. The 90s
      threshold is tighter than the 600s gate in `session-usage-check.sh`
      because here we need an accurate `RESET_EPOCH` for the delay
      computation, not just a liveness check.
-  4. Write `RESET_EPOCH` to `/tmp/orch-quota-paused-until`.
-  5. Compute `DELAY = min(3600, max(60, RESET_EPOCH + 60 - now))`.
-  6. Telegram: `"⏸ Session quota at N% — pausing until reset (~ETA).
-     Coordinators continue in tmux; will auto-resume."` (sent once only).
-  7. `ScheduleWakeup(DELAY)`. End tick.
+  3. **SIGTERM all in-flight coordinator processes.** Coordinators share
+     the orchestrator's Anthropic quota and will be killed at 100% anyway
+     — a controlled SIGTERM preserves partial work for resume. For each
+     in-flight coord: enumerate pane PIDs via `tmux list-panes -F
+     '#{pane_pid}'`, SIGTERM + 10 s grace + SIGKILL survivors. Worktrees
+     are preserved in all cases. The tmux window is conditionally
+     preserved: if the coord has a checkpoint (`phases_completed` non-empty),
+     preserve the window (for `respawn-window -k` on resume) and write
+     `.done` + exit `99`; otherwise kill the window with `tmux kill-window`
+     and skip `.done`/`.exit` so Fresh top-up can use `tmux new-window`
+     cleanly on the next tick. See `orch-start.md §0a` for the exact bash.
+  4. Clear `attrs._coordinator_tmux_window` for each SIGTERM'd task
+     (one PATCH per task, AFTER processes are dead). This makes the next
+     tick classify the task as Resumable (checkpoint present) or Fresh
+     (no checkpoint) rather than In-flight.
+  5. Write `RESET_EPOCH` to `/tmp/orch-quota-paused-until`.
+  6. Compute `DELAY = min(3600, max(60, RESET_EPOCH + 60 - now))`.
+  7. Telegram: `"⏸ Session quota at N% — pausing. SIGTERMed K
+     coordinators; will respawn on resume (~ETA)."` (sent once only).
+  8. `ScheduleWakeup(DELAY)`. End tick.
 
 **Why not CronCreate?** `CronCreate` starts a brand-new session
 (`<<autonomous-loop>>`), not the current one. It cannot resume the
@@ -292,19 +332,31 @@ and shippable. Route on this signal:
 
 - **Crashed** — `_coordinator_tmux_window` set AND
   `/tmp/coord-<short-id>.done` exists AND `task.status == in_progress`.
-  Coordinator exited without calling `release_task`. Read first 500
-  chars of the log for context. Then: `add_note("coord exited without
-  release_task")`, `release_task(blocked)`, partial-ship, Telegram. Clear
-  `_coordinator_tmux_window`. File a self-improvement task.
+  Apply the checkpoint guard (see `orch-start.md` §3b): if
+  `attrs.checkpoint.phases_completed` is non-empty, take the resume path
+  (no release, clear window attr, partial cleanup, queue for next-tick
+  respawn); otherwise fall through to last-resort salvage (`release_task
+  blocked`, partial-ship, Telegram, self-improvement task).
 
 - **In-flight** — `_coordinator_tmux_window` set, neither of the above.
   Coordinator is still working. Heartbeat in §4b.
 
-- **Fresh** — `_coordinator_tmux_window` unset, or both the `.done`
-  file and tmux window are gone (orphan from a prior session). Joins
-  top-up candidates in §4c. **Legacy**: tasks with the old
-  `attrs._coordinator_task_id` (Agent-tool era, v3) are treated as
-  fresh — clear the stale attr on reclaim.
+- **Fresh** — `_coordinator_tmux_window` unset (or both the `.done`
+  file and tmux window are gone) AND (`attrs.checkpoint` absent OR
+  `attrs.checkpoint.phases_completed` empty). Joins top-up candidates
+  in §4c. **Legacy**: tasks with the old `attrs._coordinator_task_id`
+  (Agent-tool era, v3) are treated as fresh — clear the stale attr on
+  reclaim.
+
+- **Resumable** — `_coordinator_tmux_window` unset (or named window gone),
+  `attrs.checkpoint.phases_completed` non-empty, `task.status ∈
+  {ready, in_progress}`. Joins top-up candidates in §4c with priority
+  over Fresh tasks. Respawned via `build-coord-prompt.py --resume
+  --workflow <checkpoint.workflow>` (see `orch-start.md` §6d). Before
+  invoking `--resume`, a workflow version guard checks
+  `attrs.checkpoint.workflow_version` vs `attrs.workflow_version_id`;
+  on mismatch the task is blocked with a partial-ship PR instead of
+  entering an infinite respawn loop (see `orch-start.md` §6d, M2).
 
 Post-reap cleanup: after all released/crashed tasks are handled, sweep
 `/tmp/coord-*.done` files whose corresponding tasks no longer have
@@ -320,10 +372,20 @@ heartbeat itself mid-fan-out.
 
 ### 4c. TOP UP
 
-Count remaining slots (`10 - in_flight_count`). Walk the fresh queue in
-oldest-`updated_at` order, applying **dependency gating** to each
-candidate, until SLOTS eligible candidates are found (or the queue is
-exhausted).
+Count remaining slots (`10 - in_flight_count`). Split §4a candidates into
+two sub-queues and walk in order:
+
+**1. Resumable queue** (Resumable tasks, oldest-`updated_at` first) — walked
+first. For each resumable candidate, apply dependency gating. Additionally
+apply the headroom gate: if `USAGE_PERCENT >= ORCH_RESUME_USAGE_HEADROOM`
+(env var, default 75), defer the candidate with an `add_note`
+(`"deferred resume: USAGE_PERCENT=X% >= headroom=Y%"`) and do NOT consume
+a slot. This prevents respawning a coord that would immediately hit the 94%
+pause threshold again. If `SLOTS == 0` after the Resumable walk, skip to §8.
+
+**2. Fresh queue** (Fresh tasks, oldest-`updated_at` first) — walked second.
+Apply **dependency gating** to each candidate, until SLOTS eligible
+candidates are found (or the queue is exhausted).
 
 **Dependency gating (pre-claim, runs on every fresh candidate).** Call
 `get_dependencies(task_id)` to list the candidate's blockers. For each
@@ -414,9 +476,15 @@ the next orchestrator session to reap.
 
 ## 5. Coordinator invocation
 
-Each claimed task spawns one coordinator child in a new tmux window
-via `claude -p`. The coordinator is a full Claude session (model
-opus for non-trivial tasks, sonnet for lightweight) whose prompt is
+Each claimed task spawns one coordinator child in a tmux window via
+`claude -p`. **Resumable tasks** reuse the existing `coord-<short>`
+window slot via `tmux respawn-window -k` (dead panes from the previous
+run are replaced) and pass `--resume --workflow <attrs.checkpoint.workflow>`
+to `build-coord-prompt.py` so the coordinator restarts from its last
+checkpoint phase. Fresh tasks use `tmux new-window` as before. See
+`orch-start.md` §6d for the exact commands. The coordinator is a full
+Claude session (model opus for non-trivial tasks, sonnet for lightweight)
+whose prompt is
 composed of four parts:
 
 - **Part 0 — single-turn session guidance.** Always first. States
@@ -877,7 +945,9 @@ The loop stops (does not `ScheduleWakeup`) when:
 - Context usage ≥95% (step 0 context gate — heartbeats in-flight tasks
   before stopping so leases survive until a new session picks up).
 - Auth check fails (`whoami != claude_orch`).
-- 3 consecutive empty ticks (idle pause).
+- 3 consecutive empty ticks (idle pause — zero in-flight, zero fresh,
+  zero pending-resume; deferred-Resumable ticks are not empty and reset
+  the counter).
 - Owner invokes `/orch-stop`.
 - User manually intervenes in-session.
 
@@ -933,6 +1003,14 @@ pursued:
   heartbeat/top-up). Coordinator/specialist launches now use
   `script -qefc '<cmd>' <log>` to preserve line-buffered pty output so
   panes and logs stream live — see `docs/orchestrator/tmux-delegation.md`.
+
+- ~~**Coord deaths become invisible.** Quota-kill, OOM, or network loss
+  caused coord processes to die silently; the orchestrator had no path
+  to resume partial work and fell through to §3b salvage (blocked PR,
+  self-improvement task).~~ **Shipped (v6):** Checkpoint-aware respawn
+  — coord deaths (quota, OOM, network) re-enter the top-up queue as
+  Resumable and respawn from their last checkpoint phase. §3b last-resort
+  salvage is now triggered only for crashes that produced no checkpoint.
 
 **Closed v1 backlog items:** parallel child ticks — shipped in v2.
 
