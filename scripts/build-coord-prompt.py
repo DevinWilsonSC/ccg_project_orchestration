@@ -310,8 +310,8 @@ def _resume_part1_block(ckpt: dict) -> str:
     return (
         "\n**RESUMING WORKFLOW**\n"
         "This coordinator session is RESUMING from a previous interrupted run.\n"
-        f"- Workflow: {ckpt['workflow']}\n"
-        f"- Phases completed: {ckpt['phases_completed']}\n"
+        f"- Workflow: {ckpt.get('workflow', '')}\n"
+        f"- Phases completed: {ckpt.get('phases_completed', [])}\n"
         f"- Current phase (resume here): {ckpt['current_phase']}\n"
         "\n"
         "Before doing anything else: run `git status` and `git log --oneline -10` to\n"
@@ -323,7 +323,7 @@ def _resume_part1_block(ckpt: dict) -> str:
 def _resume_part2_banner(ckpt: dict) -> str:
     return (
         f">>> RESUME POINT <<<\n"
-        f"Enter at phase \"{ckpt['current_phase']}\". Phases {ckpt['phases_completed']} are already done —\n"
+        f"Enter at phase \"{ckpt['current_phase']}\". Phases {ckpt.get('phases_completed', [])} are already done —\n"
         f"do not re-execute them. Find the heading matching \"{ckpt['current_phase']}\" below and\n"
         f"start from there.\n"
         "---\n\n"

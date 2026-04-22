@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 
@@ -87,7 +87,7 @@ def run(task_id: str, phase: str) -> int:
         ),
         "phases_completed": phases_completed,
         "current_phase": phase,
-        "updated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "by_coord": _get_by_coord(),
     }
 

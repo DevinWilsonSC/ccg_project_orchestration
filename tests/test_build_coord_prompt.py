@@ -72,8 +72,9 @@ def test_resume_banner_at_top_of_part2(task_with_checkpoint):
 
 def test_resume_full_body_retained(task_with_checkpoint):
     prompt = _build(task_with_checkpoint, resume=True)
-    assert "DESIGN" in prompt
-    assert "INTEGRATE" in prompt
+    assert "## Phase 1 — DESIGN" in prompt
+    assert "## Phase 3 — INTEGRATE" in prompt
+    assert "## Phase 6 — COMMIT" in prompt
 
 
 def test_normal_mode_unaffected(base_task):

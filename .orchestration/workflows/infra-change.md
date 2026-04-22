@@ -122,7 +122,7 @@ Do not write any Terraform until the design doc exists.
 
 ---
 
-### Phase 2 — SECURITY REVIEW
+### Phase 2 — SECURITY_REVIEW
 
 **CHECKPOINT (run this first, before any other action in this phase):**
 ```bash
@@ -167,7 +167,7 @@ reviewed; apply is the owner's explicit action.
 
 ---
 
-### Phase 4 — PLAN REVIEW
+### Phase 4 — PLAN_REVIEW
 
 **CHECKPOINT (run this first, before any other action in this phase):**
 ```bash
