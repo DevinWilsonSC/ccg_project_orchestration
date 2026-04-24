@@ -81,3 +81,36 @@ def test_normal_mode_unaffected(base_task):
     prompt = _build(base_task, resume=False)
     assert "RESUMING" not in prompt
     assert "RESUME POINT" not in prompt
+
+
+# --- Part 0 content tests ---
+
+def _part0(task_id="aaaaaaaa-0000-0000-0000-000000000000"):
+    return bcp.part0(task_id=task_id, short=task_id[:8], worktree="/tmp/test", window="coord-aaaaaaaa")
+
+
+def test_part0_starts_with_hash():
+    assert _part0().lstrip("\n").startswith("#")
+
+
+def test_part0_no_tmux_references():
+    p0 = _part0()
+    for term in ("tmux", "split-pane", "script -qefc", "SINGLE-TURN SESSION", "ScheduleWakeup"):
+        assert term not in p0, f"Part 0 must not contain {term!r}"
+
+
+def test_part0_no_claude_p_references():
+    p0 = _part0()
+    assert "claude -p" not in p0
+
+
+def test_part0_sendmessage_pattern():
+    assert "SendMessage" in _part0()
+
+
+def test_part0_team_lead_context():
+    assert "team lead" in _part0().lower() or "team-lead" in _part0().lower()
+
+
+def test_part0_checkpoint_discipline_retained():
+    assert "checkpoint_phase.py" in _part0()
