@@ -11,7 +11,7 @@ drives you, not the owner. On each tick you:
 2. **HEARTBEAT** the lease on every task still in-flight.
 3. **TOP UP** to 10 concurrent in-flight tasks by claiming fresh queue
    entries and launching a per-task coordinator child via
-   `tmux new-window` + `claude -p` (see §6d).
+   `TeamCreate` + `SendMessage` (see §6d).
 
 Then go back to sleep via `ScheduleWakeup`.
 
@@ -47,47 +47,10 @@ below depends on rules there.
        Tick still runs. Do not stop.
 4. Confirm `gh` is authenticated (`gh auth status`). If not, stop — the
    ship path needs it.
-5. Confirm tmux is available: run `tmux list-sessions` (or `tmux -V`).
-   The orchestrator launches coordinators via `tmux new-window` +
-   `claude -p`, so tmux must be running. If not inside a tmux session,
-   stop and tell the owner: "Start the orchestrator inside tmux:
-   `tmux new-session -s orch` then run `/orch-start`."
-6. Confirm `claude` CLI is available: `which claude`. Coordinators and
+5. Confirm `claude` CLI is available: `which claude`. Coordinators and
    specialists are spawned as `claude -p` processes. If the CLI is not
    on PATH, stop and surface to the owner.
-7. **Arm the coordinator-completion watcher.** Start a persistent
-   `Monitor` that emits one stdout line per new `/tmp/coord-*.done`
-   file. This turns the 20-min tick cadence into "tick at most every
-   20 min, sooner if a coordinator finishes" — critical because a
-   coordinator can otherwise sit with its branch un-shipped for up to
-   20 min after it releases. One watcher per session covers every
-   coordinator (including ones launched on later ticks); the `seen`
-   de-dup list ensures each `.done` file fires exactly one notification.
-
-   ```bash
-   seen=""
-   while true; do
-     for f in /tmp/coord-*.done; do
-       [ -e "$f" ] || continue
-       case " $seen " in *" $f "*) continue ;; esac
-       short=$(basename "$f" .done | sed 's/^coord-//')
-       exit_code="?"
-       [ -f "/tmp/coord-${short}.exit" ] && exit_code=$(cat "/tmp/coord-${short}.exit" 2>/dev/null || echo "?")
-       last_line=$(grep -v '^$' "/tmp/coord-${short}.log" 2>/dev/null | tail -1 | head -c 120)
-       echo "COORD_DONE ${short} exit=${exit_code} last=\"${last_line}\""
-       seen="$seen $f"
-     done
-     sleep 5
-   done
-   ```
-
-   Call `Monitor` with `persistent: true` and the max allowed
-   `timeout_ms` (3600000). If arming fails, proceed anyway — the tick
-   still runs; the only cost is waiting for the next scheduled wake-up
-   to reap. Do not re-arm on later ticks; a single persistent watcher
-   lasts the session.
-
-8. **Telegram send primitive.** Every `Telegram: "..."` annotation in the
+6. **Telegram send primitive.** Every `Telegram: "..."` annotation in the
    tick protocol below means "call `tg-send` with this message", not "call
    the MCP tool directly". `tg-send` is a procedural recipe that:
    (a) checks `scripts/telegram-mcp-health.sh` before each send,
@@ -103,47 +66,6 @@ If MCP taskforge tools are available in this session, prefer those; if
 not, use `curl` against the REST API with `-H "X-API-Key: $TASKFORGE_API_KEY"`.
 All the primitives below have REST equivalents documented in
 your taskforge instance's app/routers/.
-
----
-
-## Event-driven early reap
-
-When the `Monitor` from preflight step 7 emits `COORD_DONE <short-id>
-exit=<N> last="<line>"`, the orchestrator must handle it promptly
-rather than waiting for the next scheduled tick. On each such
-notification:
-
-1. Confirm the coordinator truly completed: `/tmp/coord-<short-id>.done`
-   exists and `/tmp/coord-<short-id>.exit` is readable.
-2. Re-fetch the task from Taskforge. Three cases:
-   - Task has `_coordinator_tmux_window` still set → run the relevant
-     REAP branch (3a or 3b) for that single task. The ship-on-status
-     fast path may have missed it if the coord released between ticks
-     and this is the first signal.
-   - Task's `_coordinator_tmux_window` is already cleared → two sub-cases:
-     - `task.status == in_progress` AND `attrs.checkpoint.phases_completed`
-       non-empty (**Resumable** — deleted by §0a `TeamDelete`): **skip entirely**.
-       The §0a sequence already handled this; no REAP or 3c action
-       needed. The task will be respawned via TOP UP on the next full tick.
-     - Otherwise (task in terminal status, or not found): the only
-       remaining work is 3c cleanup (rm tempfiles, kill tmux window,
-       remove worktree). Run 3c for this short-id.
-   - No matching task found (orphan `.done` from a previous session)
-     → run 3c cleanup only.
-   The rest of the queue (heartbeat, top-up) is not revisited here —
-   that stays on the scheduled-tick cadence.
-3. Do **not** call `ScheduleWakeup` after handling an early-reap event;
-   the previously scheduled wakeup is still pending and will fire at
-   its original time. An early reap is an *inserted* half-tick between
-   scheduled ticks, not a replacement.
-4. If two `COORD_DONE` notifications arrive close together, handle
-   them in order — the ship path is serial (single `git` working
-   directory per worktree; independent worktrees don't conflict, but
-   the orchestrator keeps it simple by serializing).
-5. On any unexpected state during reconciliation (e.g., task is not
-   `in_progress`, no matching worktree, tmux window already gone),
-   fall through to the standard REAP reconciliation logic — do not
-   treat the Monitor event as authoritative.
 
 ---
 
@@ -226,9 +148,10 @@ fi
 are up to 5 h. Without a heartbeat each hop, in-flight task leases expire
 and get swept as crashed.
 
-**Why skip REAP in the minimal-tick:** Coordinator `.done` files
-accumulate during the pause without issue — REAP runs on the first full
-tick after quota clears.
+**Why skip REAP in the minimal-tick:** Released coordinators are detected
+via `task.status` polling on the next full tick. Skipping REAP here is safe
+because coordinator status is durable in Taskforge — it does not accumulate
+and then disappear the way `.done` temp files once did.
 
 **Why not CronCreate:** `CronCreate` fires `<<autonomous-loop>>`, which
 starts a **brand-new session** and cannot resume the current loop.
@@ -296,19 +219,7 @@ effectively disabled (fail-open).
      `attrs._coordinator_team_name`):
      ```
      TEAM_NAME=$(echo "$TASK_JSON" | jq -r '.attrs._coordinator_team_name')
-     short=$(echo "$TEAM_NAME" | sed 's/^coord-//')
      TeamDelete({ name: TEAM_NAME })
-
-     # Conditional .done marker: write only if the coord has a checkpoint.
-     # Next tick classifies checkpointed tasks as Resumable and respawns
-     # them via build-coord-prompt.py --resume. Tasks with no checkpoint
-     # re-enter the Fresh queue — no .done marker needed (Monitor does
-     # not need a synthetic event for a task re-entering from scratch).
-     HAS_CKPT=$(echo "$TASK_JSON" | jq -r 'if (.attrs.checkpoint.phases_completed // []) | length > 0 then "true" else "false" end')
-     if [ "$HAS_CKPT" = "true" ]; then
-       touch /tmp/coord-${short}.done
-       printf "99\n" > /tmp/coord-${short}.exit
-     fi
      ```
   4. **Clear `attrs._coordinator_team_name`** for each task whose team
      was deleted in step 3 (one PATCH per task). `TeamDelete` is
@@ -357,8 +268,8 @@ available.
      independent of the orchestrator's context window; ending the
      orchestrator session does not terminate them.
   3. Telegram: `"⚠ Orchestrator stopping — context at ~<N>%. Run
-     /orch-start in a new session to resume. In-flight coordinators
-     continue in their tmux windows."`
+     /orch-start in a new session to resume. In-flight coordinator
+     teammates continue running independently."`
   4. Do **NOT** call `ScheduleWakeup`. The loop ends here.
 
 Note the context threshold moved from **95% → 90%** to match the
@@ -393,63 +304,59 @@ Union three `list_tasks` queries, all filtered by
    `in_progress`, and the branch work would be stranded.
 
 REST hint: the list endpoint supports `?status=X&assigned_to_id=<uuid>`
-as a server-side filter. Filter by `attrs._coordinator_tmux_window`
+as a server-side filter. Filter by `attrs._coordinator_team_name`
 client-side after the fetch (the three terminal-status queries return
 small result sets in practice — only tasks this orchestrator personally
 launched).
 
 Merge the three result sets. For each returned task, read
-`attrs._coordinator_tmux_window` and classify. The **ship signal is
-Taskforge status, not the `.done` FS marker.** A coord that calls
-`release_task` can still be alive for 10–60s while it emits final
-narrative and `script`'s pty flushes — but per Part 3 of the coord
-prompt, `release_task` is the LAST meaningful step (after commit,
-after `attrs.completion`), so once status is terminal the branch is
-frozen and shippable. The `.done` marker is now only used to detect
-coords that crashed without calling `release_task`.
+`attrs._coordinator_team_name` and classify.
 
-- **Released (ship now):** `_coordinator_tmux_window` is set AND
+**Completion detection:** the ship signal is Taskforge status. A
+coordinator calls `release_task` when done, setting terminal status; once
+set, the branch is frozen and shippable. The primary detection path is
+the tick-interval `list_tasks` poll. Coordinators may also notify early
+by sending an explicit `SendMessage` to the orchestrator — handle it the
+same as a Released classification (branch on `task.status` and run the
+appropriate ship or partial-ship path; do not call `ScheduleWakeup` after
+an early-reap event, as the next scheduled wake-up is still pending).
+
+Coordinators that crash without calling `release_task` are detected via
+lease expiry — `sweep_expired_leases` reverts `in_progress` to `todo`
+after 30 min. If `attrs.checkpoint.phases_completed` is non-empty, the
+task re-enters as Resumable on the next tick; otherwise as Fresh.
+
+- **Released (ship now):** `_coordinator_team_name` is set AND
   `task.status` ∈ {`done`, `blocked`, `waiting_on_human`} AND
-  `attrs.completion` is present. Ship immediately (step 3) regardless
-  of whether `/tmp/coord-<short-id>.done` exists yet.
-- **Crashed (resume or salvage):** `_coordinator_tmux_window` is set AND
-  `/tmp/coord-<short-id>.done` exists AND `task.status == in_progress`
-  (coord `claude -p` exited without calling `release_task`). Step 3
-  applies the checkpoint guard: if `attrs.checkpoint.phases_completed`
-  is non-empty, take the resume path; otherwise fall through to §3b
-  last-resort salvage.
-- **In-flight:** `_coordinator_tmux_window` is set AND neither of the
-  above — the coord is still working (or still emitting final output
-  after a release that hasn't propagated yet). Heartbeat in step 4.
-- **Fresh:** `_coordinator_tmux_window` is unset (or both the `.done`
-  file and tmux window are gone) AND (`attrs.checkpoint` is absent OR
-  `attrs.checkpoint.phases_completed` is empty). A fresh task joins
-  the top-up candidates in step 5 for a new coordinator spawn.
-- **Resumable:** `_coordinator_tmux_window` is unset (or the named
-  window no longer exists) AND `attrs.checkpoint.phases_completed` is
-  a non-empty list AND `task.status` is `ready` or `in_progress`.
-  These are coords whose teams were deleted by §0a `TeamDelete` on
-  quota pause, or that died after writing at least one checkpoint
-  phase. They join the top-up candidates in step 5, walked before the
-  Fresh queue, and are respawned via `build-coord-prompt.py --resume`
-  (see §5, §6d).
+  `attrs.completion` is present. Ship immediately (step 3).
+- **In-flight:** `_coordinator_team_name` is set AND task is not Released
+  — the coord is still working. Heartbeat in step 4.
+- **Fresh:** `_coordinator_team_name` is unset AND (`attrs.checkpoint` is
+  absent OR `attrs.checkpoint.phases_completed` is empty). Joins the
+  top-up candidates in step 5 for a new coordinator spawn.
+- **Resumable:** `_coordinator_team_name` is unset AND
+  `attrs.checkpoint.phases_completed` is a non-empty list AND
+  `task.status` is `ready` or `in_progress`. These are coords whose
+  teams were deleted by §0a `TeamDelete` on quota pause, or that died
+  after writing at least one checkpoint phase. They join the top-up
+  candidates in step 5, walked before the Fresh queue, and are
+  respawned via `build-coord-prompt.py --resume` (see §5, §6d).
 
-Note (N2 — tiebreaker): a task with `_coordinator_tmux_window` set
-AND the named window still alive is **In-flight** even if
-`attrs.checkpoint.phases_completed` is non-empty — the checkpoint is
-advisory while the coord is alive. Resumable status fires only after
-the attr is cleared (by §0a `TeamDelete` or by crash-with-checkpoint in §3).
+Note (N2 — tiebreaker): a task with `_coordinator_team_name` set is
+**In-flight** even if `attrs.checkpoint.phases_completed` is non-empty —
+the checkpoint is advisory while the coord is alive. Resumable status
+fires only after the attr is cleared (by §0a `TeamDelete` or by lease
+expiry).
 
 Note: the three-query union already covers Resumable tasks —
 `status='in_progress'` (query #2) fetches paused tasks whose leases
-were heartbeated before the §0a TeamDelete sequence ran. Resumable vs Fresh is client-side
-classification based on `attrs.checkpoint.phases_completed`.
+were heartbeated before the §0a TeamDelete sequence ran. Resumable vs
+Fresh is client-side classification based on `attrs.checkpoint.phases_completed`.
 
-Orphan handling: a task whose `_coordinator_tmux_window` points to a
-tmux window that no longer exists (because the previous orchestrator
-session ended) is treated as fresh — reclaim on top-up. The orphaned
-`claude -p` process died with its tmux session; the Taskforge lease
-will have expired or will expire shortly via `sweep_expired_leases`.
+Orphan handling: a task whose `_coordinator_team_name` refers to a team
+that no longer exists (because the previous orchestrator session ended) is
+treated as Fresh — clear the stale attr on reclaim. The lease will have
+expired or will expire shortly via `sweep_expired_leases`.
 
 Legacy handling: tasks with the old `attrs._coordinator_task_id` (from
 the Agent-tool era) are treated as fresh — clear the stale attr on
@@ -457,28 +364,10 @@ reclaim.
 
 ### 3. REAP released coordinators
 
-Handle the two reap buckets from step 2. Both run the ship path
-(full or partial); the difference is how we got here.
+For every task classified as **Released** in step 2 (terminal status +
+`completion` present + `_coordinator_team_name` set):
 
-#### 3a. Released bucket (ship-on-status)
-
-For every task classified as **Released** in step 2 (terminal status
-+ `completion` present + window attr set):
-
-1. Read the final non-empty line of `/tmp/coord-<short-id>.log` if the
-   file exists and is non-empty. The coord prompt (§6d Part 3)
-   mandates the final line be `RELEASED <done|blocked|waiting_on_human>`.
-   It's diagnostic only — `task.status` and `attrs.completion` are the
-   authoritative signal. Reasons the final line may be absent:
-   - coord is still alive, `script` hasn't flushed yet (benign);
-   - coord released but forgot the echo (file a self-improvement task
-     later so the prompt can be strengthened).
-
-   Do NOT block on the final line. If it's missing, record one note:
-   `add_note(<task>, "ship-on-status: final-line marker absent at
-   reap time")` for prompt-tuning signal, then proceed.
-
-2. Branch on `task.status`:
+1. Branch on `task.status`:
    - **`done`** → run the **ship path** (§7) including auto-merge.
    - **`blocked`** or **`waiting_on_human`** → run the **partial-ship
      path** (§7, steps 1–5 only — push branch + open PR, then **STOP
@@ -490,80 +379,10 @@ For every task classified as **Released** in step 2 (terminal status
      of the work before hitting the blocker, and the owner needs the
      PR to judge what's salvageable.
 
-3. Clear `attrs._coordinator_tmux_window` so the slot is freed for
-   top-up. **Do NOT kill the tmux window or rm tempfiles yet** — the
-   coord `claude -p` may still be alive finalizing output. Tempfiles
-   and the window get swept by step 3c below once the `.done` marker
-   appears.
-
-#### 3b. Crashed bucket — checkpoint guard, then last-resort salvage
-
-For every task classified as **Crashed** in step 2 (`_coordinator_tmux_window`
-set AND `/tmp/coord-<short-id>.done` exists AND `task.status == in_progress`):
-
-**First: re-fetch the task and check `attrs.checkpoint.phases_completed`.**
-
-- **Non-empty** — coord checkpointed at least once. Take the **resume path**:
-  1. DO NOT call `release_task`. Task stays `in_progress`.
-  2. Clear `attrs._coordinator_tmux_window` (PATCH).
-  3. Partial cleanup: `rm -f /tmp/coord-<short>.prompt /tmp/coord-<short>.exit`;
-     rename `/tmp/coord-<short>.log → /tmp/coord-<short>.log.prev`.
-     DO NOT remove the worktree. DO NOT `rm /tmp/coord-<short>.done`
-     (Monitor already fired; the next respawn's stale-sidecar cleanup in
-     §6d Step 1 sweeps it before relaunch).
-  4. `add_note(task, "coord died after phases_completed=<list> — resume queued for next tick (will respawn from <checkpoint.current_phase>)")`.
-  5. Telegram: `"♻ <short> died after <phases_completed[-1]> — will resume next tick from <checkpoint.current_phase>"`.
-  6. DO NOT partial-ship. DO NOT file a self-improvement task (this is expected behavior, not a prompt bug).
-  7. Done — next tick classifies this task as Resumable and respawns it via `--resume`.
-
-- **Empty or absent** — coord died before any checkpoint. Fall through to
-  last-resort salvage below.
-
-**Last-resort salvage** (applies ONLY when `checkpoint` is absent OR
-`phases_completed` is empty). The coord exited without calling
-`release_task` and without a usable checkpoint. Read the first 500
-chars of `/tmp/coord-<short-id>.log` for diagnostic context. Then:
-
-1. `add_note(<task>, "coord exited without release_task — treating as
-   timeout:\n<log-excerpt>")`.
-2. `release_task(final_status='blocked')`.
-3. Run the **partial-ship path** (push branch + open PR, skip
-   auto-merge). Even a crashed coord's work lands as a reviewable PR
-   rather than being lost.
-4. Telegram: blocker notification (as in 3a for blocked).
-5. File a self-improvement task so the owner can strengthen the coord
-   prompt.
-6. Clear `attrs._coordinator_tmux_window`. Tempfiles and tmux window
-   cleanup happens in 3c (the `.done` is already present, so 3c
-   fires this tick).
-
-#### 3c. Post-ship cleanup sweep
-
-Run this **after** all 3a/3b reaps for the tick. For every
-`/tmp/coord-<short-id>.done` on disk, check whether any task still
-has `_coordinator_tmux_window` set to `coord-<short-id>`:
-
-- **Yes** — the window attr wasn't cleared (shouldn't happen after
-  3a/3b but be defensive). Skip.
-- **No** — coord has been reaped or is Resumable. Re-fetch the task
-  and branch:
-  - `task.status == in_progress` AND `attrs.checkpoint.phases_completed`
-    non-empty (**Resumable**): skip worktree removal and `.done` removal
-    — the worktree is needed for respawn on the next tick. Optionally
-    `rm -f /tmp/coord-<short-id>.{prompt,exit}` if the §3b resume path
-    did not already do so.
-  - Otherwise (task in terminal status or not found): full cleanup:
-    ```bash
-    rm -f /tmp/coord-<short-id>.{prompt,log,exit,done}
-    rm -f /tmp/specialist-*-<short-id>.{prompt,log,persona,done}
-    tmux kill-window -t "coord-<short-id>" 2>/dev/null || true
-    git worktree remove --force .worktrees/task-<short-id> 2>/dev/null || true
-    ```
-
-This means a coord reaped via 3a ship-on-status (before `.done` was
-written) has its tempfiles swept on whichever later tick sees the
-`.done` appear — usually within one tick. Resumed coords skip the
-full sweep until the second coordinator finishes and releases.
+2. Clear `attrs._coordinator_team_name` so the slot is freed for top-up.
+   The ship path (§7 step 7) removes the worktree. No further cleanup
+   sweep is needed — coordinators running as Teams teammates leave no
+   temp files or tmux windows.
 
 ### 4. HEARTBEAT still-in-flight tasks
 
@@ -883,14 +702,6 @@ Telegram: `"▶ Starting <short-id> \"<title>\" (repo=<repo_path>, branch=task/.
 Telegram: `"🧠 Delegating <short-id> to <workflow-name> coordinator"`.
 
 **Step 1 — Pre-launch prep and prompt build.**
-
-**Resumable tasks only — stale sidecar cleanup** (do this before building
-the prompt, to prevent the Monitor from re-firing the old `.done` event):
-```bash
-rm -f /tmp/coord-<short>.done
-rm -f /tmp/coord-<short>.exit
-[ -f /tmp/coord-<short>.log ] && mv /tmp/coord-<short>.log /tmp/coord-<short>.log.prev
-```
 
 **Resumable tasks only — worktree existence check** (the worktree was
 preserved on §0a `TeamDelete`; §6c creates worktrees for fresh tasks):
@@ -1452,11 +1263,10 @@ This is the first tick of this session. Do these extras once:
    to a background Agent not visible in this session's `TaskList`
    counts as **fresh** (orphaned — the previous session's background
    child died with it). Clear the stale id during top-up.
-3. Preflight step 7 (coordinator-completion watcher) was armed during
-   preflight and persists for the session. On a new session, any
-   `.done` files left over from prior-session coordinators will fire
-   immediately through the Monitor — treat those as early-reap events
-   the same as live completions.
+3. Any coordinators from a previous session that released while the
+   orchestrator was offline will appear as Released (terminal status +
+   `completion` present) in the step 2 `list_tasks` poll — they are
+   reaped normally on the first full tick.
 4. Telegram: `"🟢 Orchestrator online. Polling every 20 min. /orch-stop
    to pause."`
 5. Proceed with the normal tick protocol.
