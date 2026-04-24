@@ -188,7 +188,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     cfg = load_config()
     with httpx.Client(
-        headers={"Authorization": f"Bearer {cfg['api_key']}"},
+        headers={"X-API-Key": cfg['api_key']},
         timeout=10.0,
     ) as client:
         args.func(args, cfg, client)
