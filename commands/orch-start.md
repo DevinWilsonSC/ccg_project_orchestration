@@ -122,7 +122,7 @@ notification:
      and this is the first signal.
    - Task's `_coordinator_tmux_window` is already cleared → two sub-cases:
      - `task.status == in_progress` AND `attrs.checkpoint.phases_completed`
-       non-empty (**Resumable** — SIGTERMed by §0a): **skip entirely**.
+       non-empty (**Resumable** — deleted by §0a `TeamDelete`): **skip entirely**.
        The §0a sequence already handled this; no REAP or 3c action
        needed. The task will be respawned via TOP UP on the next full tick.
      - Otherwise (task in terminal status, or not found): the only
@@ -286,62 +286,36 @@ effectively disabled (fail-open).
      If `session-usage-watcher.py --once` fails (Chrome unreachable),
      it exits non-zero but writes nothing; the stale values are used
      rather than blocking the pause.
-  3. **SIGTERM all in-flight coordinator processes.** Coordinators share
-     the orchestrator's Anthropic quota and will be killed at 100%
-     anyway — a controlled SIGTERM is strictly better than an
-     uncontrolled death. Worktrees are preserved in all cases. The
-     tmux window is conditionally preserved — only if the coord has a
-     checkpoint (see below). Track `K` = number of coord windows
-     processed.
-     For each in-flight coord window:
-     ```bash
-     COORD_WINDOW="coord-<short>"
+  3. **TeamDelete all in-flight coordinator teams.** Coordinators share
+     the orchestrator's Anthropic quota; `TeamDelete` sends a graceful
+     shutdown signal that is strictly better than an uncontrolled death
+     at 100%. Worktrees are preserved in all cases. Track `K` = number
+     of coordinator teams deleted.
 
-     # Enumerate all pane PIDs (includes specialist split-panes)
-     PANE_PIDS=$(tmux list-panes -t "$COORD_WINDOW" -F '#{pane_pid}' 2>/dev/null || echo "")
+     For each in-flight coordinator (identified by
+     `attrs._coordinator_team_name`):
+     ```
+     TEAM_NAME=$(echo "$TASK_JSON" | jq -r '.attrs._coordinator_team_name')
+     short=$(echo "$TEAM_NAME" | sed 's/^coord-//')
+     TeamDelete({ name: TEAM_NAME })
 
-     if [ -n "$PANE_PIDS" ]; then
-       # SIGTERM every pane PID and its child tree
-       for PANE_PID in $PANE_PIDS; do
-         pkill -TERM -P "$PANE_PID" 2>/dev/null || true
-         kill -TERM "$PANE_PID" 2>/dev/null || true
-       done
-
-       # Bounded grace period (10 s is enough for claude -p to flush)
-       sleep 10
-
-       # SIGKILL any survivors
-       for PANE_PID in $PANE_PIDS; do
-         pkill -KILL -P "$PANE_PID" 2>/dev/null || true
-         kill -KILL "$PANE_PID" 2>/dev/null || true
-       done
-     fi
-
-     # Conditional window preservation (M3): preserve window only if
-     # the coord has a checkpoint — next tick will classify it Resumable
-     # and use respawn-window -k. If no checkpoint, the task re-spawns
-     # Fresh; kill the stale window now so tmux new-window succeeds on
-     # next tick. Also skip .done/.exit for no-checkpoint coords — the
-     # Monitor does not need a synthetic event for a task re-entering
-     # the Fresh queue from scratch.
+     # Conditional .done marker: write only if the coord has a checkpoint.
+     # Next tick classifies checkpointed tasks as Resumable and respawns
+     # them via build-coord-prompt.py --resume. Tasks with no checkpoint
+     # re-enter the Fresh queue — no .done marker needed (Monitor does
+     # not need a synthetic event for a task re-entering from scratch).
      HAS_CKPT=$(echo "$TASK_JSON" | jq -r 'if (.attrs.checkpoint.phases_completed // []) | length > 0 then "true" else "false" end')
      if [ "$HAS_CKPT" = "true" ]; then
-       # Preserve window for respawn-window -k on resume
-       touch /tmp/coord-<short>.done
-       printf "99\n" > /tmp/coord-<short>.exit
-     else
-       # No checkpoint — Fresh respawn on next tick; kill stale window
-       tmux kill-window -t "$COORD_WINDOW" 2>/dev/null || true
+       touch /tmp/coord-${short}.done
+       printf "99\n" > /tmp/coord-${short}.exit
      fi
      ```
-     See `docs/designs/wfe-ckpt-3-respawn.md` §1 for specialist
-     split-pane handling and full rationale.
-  4. **Clear `attrs._coordinator_tmux_window`** for each SIGTERM'd task
-     (one PATCH per task). Clear AFTER processes are dead (step 3) —
-     clearing before kill would mis-classify the task as Resumable/Fresh
-     before SIGTERM completes. This attr being unset is what makes the
-     next tick classify the task as Resumable (if it has a checkpoint)
-     rather than In-flight.
+  4. **Clear `attrs._coordinator_team_name`** for each task whose team
+     was deleted in step 3 (one PATCH per task). `TeamDelete` is
+     synchronous and blocks until graceful shutdown completes, so it is
+     always safe to clear the attr immediately after the call returns.
+     This attr being unset is what makes the next tick classify the task
+     as Resumable (if it has a checkpoint) rather than In-flight.
   5. **Write the quota-pause state file:**
      `echo "$RESET_EPOCH" > /tmp/orch-quota-paused-until`. This ensures
      subsequent chained wakeups enter the minimal-tick path (Guard A)
@@ -352,9 +326,10 @@ effectively disabled (fail-open).
      at 3600s, so a reset >1 h away produces a chain of 1-hour
      wakeups — each a minimal-tick (Guard A) that heartbeats leases
      and re-schedules without Telegram noise.
-  7. Telegram: `"⏸ Session quota at <N>% — pausing. SIGTERMed <K>
-     coordinators; will respawn on resume (~<ETA>)."` **This message
-     is sent exactly once** — chained wakeups skip Telegram via Guard A.
+  7. Telegram: `"⏸ Session quota at <N>% — pausing. Deleted <K>
+     coordinator teams via TeamDelete; will respawn on resume
+     (~<ETA>)."` **This message is sent exactly once** — chained
+     wakeups skip Telegram via Guard A.
   8. `ScheduleWakeup(delaySeconds=DELAY, prompt='<<autonomous-loop-dynamic>>',
      reason='quota pause until reset')`. **End the tick here** —
      no further steps run.
@@ -377,10 +352,10 @@ available.
   ~<N>% — approaching limit"`. Proceed concisely.
 - **≥90%:** graceful shutdown:
   1. **HEARTBEAT** all currently in-flight tasks one final time.
-  2. **Do NOT kill coordinator tmux windows.** §0b does NOT SIGTERM
-     coords (unlike §0a). Coord processes are independent of the
-     orchestrator's context window; ending the orchestrator session
-     does not kill them.
+  2. **Do NOT call TeamDelete on coordinator teams.** §0b does not shut
+     down coordinators (unlike §0a). Coordinator teammate sessions are
+     independent of the orchestrator's context window; ending the
+     orchestrator session does not terminate them.
   3. Telegram: `"⚠ Orchestrator stopping — context at ~<N>%. Run
      /orch-start in a new session to resume. In-flight coordinators
      continue in their tmux windows."`
@@ -453,20 +428,21 @@ coords that crashed without calling `release_task`.
 - **Resumable:** `_coordinator_tmux_window` is unset (or the named
   window no longer exists) AND `attrs.checkpoint.phases_completed` is
   a non-empty list AND `task.status` is `ready` or `in_progress`.
-  These are coords that were SIGTERMed on quota pause (§0a) or died
-  after writing at least one checkpoint phase. They join the top-up
-  candidates in step 5, walked before the Fresh queue, and are
-  respawned via `build-coord-prompt.py --resume` (see §5, §6d).
+  These are coords whose teams were deleted by §0a `TeamDelete` on
+  quota pause, or that died after writing at least one checkpoint
+  phase. They join the top-up candidates in step 5, walked before the
+  Fresh queue, and are respawned via `build-coord-prompt.py --resume`
+  (see §5, §6d).
 
 Note (N2 — tiebreaker): a task with `_coordinator_tmux_window` set
 AND the named window still alive is **In-flight** even if
 `attrs.checkpoint.phases_completed` is non-empty — the checkpoint is
 advisory while the coord is alive. Resumable status fires only after
-the attr is cleared (by §0a SIGTERM or by crash-with-checkpoint in §3).
+the attr is cleared (by §0a `TeamDelete` or by crash-with-checkpoint in §3).
 
 Note: the three-query union already covers Resumable tasks —
-`status='in_progress'` (query #2) fetches SIGTERM'd tasks whose leases
-were heartbeated before pause. Resumable vs Fresh is client-side
+`status='in_progress'` (query #2) fetches paused tasks whose leases
+were heartbeated before the §0a TeamDelete sequence ran. Resumable vs Fresh is client-side
 classification based on `attrs.checkpoint.phases_completed`.
 
 Orphan handling: a task whose `_coordinator_tmux_window` points to a
@@ -917,7 +893,7 @@ rm -f /tmp/coord-<short>.exit
 ```
 
 **Resumable tasks only — worktree existence check** (the worktree was
-preserved on SIGTERM; §6c creates worktrees for fresh tasks):
+preserved on §0a `TeamDelete`; §6c creates worktrees for fresh tasks):
 ```bash
 WORKTREE_PATH=<repo_path>/.worktrees/task-<short>
 if [ ! -d "$WORKTREE_PATH" ]; then
