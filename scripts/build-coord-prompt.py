@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Build a coordinator prompt for `claude -p`.
+"""Build a coordinator prompt for a team-lead coordinator agent.
 
 Canonical assembly of the four-part coordinator prompt specified in
 `.claude/commands/orch-start.md` §6d:
 
-  Part 0  single-turn session guidance (anti-ScheduleWakeup, tmux -t,
-          shell-poll pattern, checkpoint discipline). ALWAYS prepended.
+  Part 0  team-lead context: teammate assignment via the Agent tool,
+          SendMessage patterns, checkpoint discipline. ALWAYS prepended.
           Starts with "# " so the assembled prompt never begins with a
-          dash (`claude -p` would parse a leading `-`/`--`/`---` as an
-          option flag and fail).
+          dash (some launchers would parse a leading `-` as an option flag).
   Part 1  task-fields block: title, description, AC, plan, tmux window.
   Part 2  workflow body, from .orchestration/workflows/<slug>.md (materialized
           cache), falling back to the taskforge REST API on miss, then
@@ -32,7 +31,7 @@ Required env vars:
   CLAUDE_ORCH_ACTOR_ID   — UUID of the claude_orch actor (or resolved via GET /actors)
 
 The orchestrator is the only caller. Top-up should invoke this once per
-newly-claimed task, then launch via tmux + `claude -p "$(cat <out>)"`.
+newly-claimed task, then pass the output path to the coordinator launcher.
 """
 from __future__ import annotations
 
@@ -201,42 +200,27 @@ def render_workflow(body: str, ctx: dict[str, str]) -> str:
 
 
 def part0(task_id: str, short: str, worktree: str, window: str) -> str:
-    return f"""# CRITICAL: SINGLE-TURN SESSION — DO NOT EXIT MID-WORKFLOW
+    return f"""# You are the team-lead coordinator for taskforge task {task_id}
 
-You are running inside `claude -p`, which is a **single-turn session**. There is
-NO resume, NO "next check", NO wake-up, NO "I'll come back later". If your
-session ends before you release the task, your work is lost and the orchestrator
-has to salvage or restart.
+You run as a **team lead** in the Claude Agent SDK. Specialist agents are your
+teammates — spawn them via the `Agent` tool and communicate with running ones
+via `SendMessage`.
 
-**Absolute rules:**
+**Teammate assignment and communication patterns:**
 
-1. You do NOT have the `ScheduleWakeup` tool. Do NOT call it. Do NOT plan
-   around it. If you think you see it, you are wrong.
-2. Never output prose like "sleeping", "wakeup scheduled", "next check",
-   "resuming later", "will check back in N minutes", "exit for now" — that
-   prose is evidence of the same hallucination.
-3. When the workflow says "wait for specialist .done", implement it as a
-   **synchronous shell poll loop inside this session** via the Bash tool:
+1. **Spawn a specialist** by calling the `Agent` tool with `subagent_type` set
+   to the role name and a self-contained prompt that includes the task context,
+   working directory, branch, and acceptance criteria.
 
-   ```bash
-   while [ ! -f /tmp/specialist-<role>-{short}.done ]; do sleep 15; done
-   ```
+2. **Parallel work** (e.g. BUILD phase): issue multiple `Agent` tool calls in a
+   single response — the runtime executes them concurrently. Collect all results
+   before proceeding to the next phase.
 
-   The `sleep` blocks inside the Bash tool call; when the file appears, the
-   loop returns and your session continues. This is the ONLY correct way to
-   wait.
-4. Stay alive through ALL phases of the workflow in THIS ONE SESSION. Then
-   release and emit the RELEASED marker (Part 3).
+3. **Sequential handoffs**: spawn each specialist only after the previous one
+   returns. Pass its result as context to the next specialist's prompt.
 
-**Tmux split-pane targeting.** Every `tmux split-pane` call MUST explicitly
-target this coord's window with `-t "{window}"`. Without `-t`, split-pane
-targets whatever pane tmux sees as active (often the orchestrator pane),
-creating orphan specialists in the wrong window. Correct form:
-
-```bash
-tmux split-pane -d -h -t "{window}" \\
-  "cd {worktree} && script -qefc '<launch cmd>' <log>; touch <done-file>"
-```
+4. **Follow-up messages** to a named running agent:
+   `SendMessage(to="<name>", message="<instructions>")`
 
 CRITICAL — Checkpoint discipline:
 At the VERY START of every phase — before spawning any specialist or writing any file —
