@@ -901,7 +901,7 @@ git worktree add -b task/<short-id>-<slug> <worktree-path> origin/dev
 
 Telegram: `"🌱 Worktree ready for <short-id> at <path>"`.
 
-#### 6d. Launch the coordinator (tmux + claude -p)
+#### 6d. Launch the coordinator (TeamCreate + SendMessage)
 
 Telegram: `"▶ Starting <short-id> \"<title>\" (repo=<repo_path>, branch=task/..., workflow=<workflow-id>)"`.
 Telegram: `"🧠 Delegating <short-id> to <workflow-name> coordinator"`.
@@ -1044,55 +1044,57 @@ inline to save tokens, that's a prompt bug — file it as an
 orchestration-improvement task (§9) so the workflow body can tighten
 its delegation language. Do not respond by forcing the task to opus.
 
-**Step 2 — Launch via tmux.** Use Bash to run, substituting `${MODEL}`
-per the rule above.
+**Step 2 — Launch via TeamCreate.** The orchestrator creates a single-teammate
+team and sends the coordinator prompt via `SendMessage`. Specialists are
+pre-populated at `TeamCreate` time by `build-coord-prompt.py` based on the
+`specialists:` frontmatter of the selected workflow. Resolve `MODEL` per the
+model-selection table above.
 
-*Fresh task (existing):*
-```bash
-tmux new-window -d -n "coord-<short-id>" \
-  "cd <worktree-path> && \
-   script -qefc 'claude -p \"\$(cat /tmp/coord-<short-id>.prompt)\" --model ${MODEL} --dangerously-skip-permissions --max-budget-usd 10 --no-session-persistence' /tmp/coord-<short-id>.log; \
-   echo \$? > /tmp/coord-<short-id>.exit; \
-   touch /tmp/coord-<short-id>.done"
+*Fresh task:*
+```
+TeamCreate({
+  name: "coord-<short-id>",
+  teammates: [{ name: "coordinator", type: "coordinator" }]
+})
+SendMessage({
+  to: "coordinator",
+  message: "$(cat /tmp/coord-<short-id>.prompt)"
+})
 ```
 
-*Resumable task (reuse existing window slot via `respawn-window -k`):*
-```bash
-COORD_WINDOW="coord-<short-id>"
-if tmux has-window -t "$COORD_WINDOW" 2>/dev/null; then
-  tmux respawn-window -k -t "$COORD_WINDOW" \
-    "cd <worktree-path> && \
-     script -qefc 'claude -p \"\$(cat /tmp/coord-<short-id>.prompt)\" --model ${MODEL} \
-       --dangerously-skip-permissions --max-budget-usd 10 --no-session-persistence' \
-       /tmp/coord-<short-id>.log; \
-     echo \$? > /tmp/coord-<short-id>.exit; \
-     touch /tmp/coord-<short-id>.done"
-else
-  # Window was manually killed — create fresh slot
-  tmux new-window -d -n "$COORD_WINDOW" \
-    "cd <worktree-path> && \
-     script -qefc 'claude -p \"\$(cat /tmp/coord-<short-id>.prompt)\" --model ${MODEL} \
-       --dangerously-skip-permissions --max-budget-usd 10 --no-session-persistence' \
-       /tmp/coord-<short-id>.log; \
-     echo \$? > /tmp/coord-<short-id>.exit; \
-     touch /tmp/coord-<short-id>.done"
-fi
-```
-`tmux respawn-window -k` kills the dead panes from the prior coord run
-and starts a fresh shell in the same `coord-<short-id>` window slot.
+The orchestrator does **not** await the coordinator's reply — `SendMessage` is
+async. The coordinator runs independently and releases via MCP/REST when done;
+the next tick REAP step detects the terminal status via `task.status`.
 
-**Why `script(1)`:** piping `claude -p` output to a file (`> FILE 2>&1`) causes full-buffered stdio — nothing reaches disk until the session exits, and nothing appears in the tmux pane either. `script -qefc '<cmd>' <log>` allocates a pseudo-tty for the child, so Node's line-buffering kicks in; the output streams to both the log file AND the tmux pane in real time. That makes fanouts observable: `tmux attach -t orch`, then `C-b n` to cycle windows — each coordinator window shows its live output, and any specialists the coordinator spawns show in split-panes within that window. `-q` suppresses script's own banner, `-e` propagates the child's exit code (captured by `$?` in the wrapper), `-f` flushes on every write.
+*Resumable task (re-create team from checkpoint):*
+```
+# Prior teammate sessions were torn down at pause time via TeamDelete.
+# Simply re-create the team; the --resume prompt encodes the checkpoint
+# phases so the coordinator skips already-completed work.
+TeamCreate({
+  name: "coord-<short-id>",
+  teammates: [{ name: "coordinator", type: "coordinator" }]
+})
+SendMessage({
+  to: "coordinator",
+  message: "$(cat /tmp/coord-<short-id>.prompt)"  # built with --resume flag
+})
+```
+The team name reuses `coord-<short-id>` for compatibility with monitoring
+tooling. There is no stale team to clean up: `TeamDelete` was called at quota
+pause time, so the slot is free.
 
 **Step 3 — Record the coordinator reference.** Write
-`attrs._coordinator_tmux_window = "coord-<short-id>"` on the
-Taskforge task so the next tick can find the coordinator's output
+`attrs._coordinator_team_name = "coord-<short-id>"` on the
+Taskforge task so the next tick can find the coordinator team
 during REAP (step 3).
 
 The orchestrator does not wait for the coordinator. It goes back to
 sleep via `ScheduleWakeup`; the next tick reaps.
 
-See `${ORCHESTRATION_DIR:-orchestration}/docs/tmux-delegation.md` for the full architecture
-of the three-tier tmux model (orchestrator → coordinator → specialists).
+See `${ORCHESTRATION_DIR:-orchestration}/docs/teams-primitives-reference.md` for the Teams
+API reference and `orchestration/docs/teams-delegation.md` for the CCG
+coordinator → specialist delegation spec.
 
 #### Coordinator prompt assembly
 
@@ -1110,14 +1112,13 @@ Never start with a YAML-style `---` frontmatter delimiter or a
 Markdown horizontal rule.
 
 **Part 0 — single-turn session guidance** (always first, prepended
-verbatim; `<tmux-window>` = `coord-<short-id>`, `<worktree-path>` +
-`<short-id>` substituted from task context):
+verbatim; `<worktree-path>` and `<short-id>` substituted from task context):
 ```
 # CRITICAL: SINGLE-TURN SESSION — DO NOT EXIT MID-WORKFLOW
 
-You are running inside `claude -p`, which is a **single-turn session**.
-There is NO resume, NO "next check", NO wake-up, NO "I'll come back
-later". If your session ends before you release the task, your work
+You are running inside a Teams teammate session, which is a **single-turn
+session**. There is NO resume, NO "next check", NO wake-up, NO "I'll come
+back later". If your session ends before you release the task, your work
 is lost and the orchestrator has to salvage or restart.
 
 **Absolute rules:**
@@ -1127,27 +1128,13 @@ is lost and the orchestrator has to salvage or restart.
 2. Never output prose like "sleeping", "wakeup scheduled", "next
    check", "resuming later", "will check back in N minutes", "exit
    for now" — that prose is evidence of the same hallucination.
-3. When the workflow says "wait for specialist .done", implement it
-   as a **synchronous shell poll loop inside this session** via the
-   Bash tool:
-   \`\`\`bash
-   while [ ! -f /tmp/specialist-<role>-<short-id>.done ]; do sleep 15; done
-   \`\`\`
-   The `sleep` blocks inside the Bash tool call; when the file
-   appears, the loop returns and your session continues. This is
-   the ONLY correct way to wait.
+3. When the workflow says "wait for specialist results", send each
+   specialist its task via `SendMessage`, then send a follow-up
+   `SendMessage` asking it to report completion. Await the reply
+   before proceeding to INTEGRATE. Do NOT use `.done` file polling —
+   that is the legacy tmux pattern and does not apply here.
 4. Stay alive through ALL phases of the workflow in THIS ONE
    SESSION. Then release and emit the RELEASED marker (Part 3).
-
-**Tmux split-pane targeting.** Every `tmux split-pane` call MUST
-explicitly target this coord's window with `-t "<tmux-window>"`.
-Without `-t`, split-pane targets whatever pane tmux currently sees
-as active (often the orchestrator's pane), which creates orphan
-specialists in the wrong window. Correct form:
-\`\`\`bash
-tmux split-pane -d -h -t "<tmux-window>" \
-  "cd <worktree-path> && script -qefc '<launch cmd>' <log>; touch <done-file>"
-\`\`\`
 ```
 
 **Part 1 — task-fields block** (always present):
@@ -1288,8 +1275,8 @@ bodies (in the DB, materialized to `.orchestration/workflows/*.md`) MUST
 NOT include their own release guidance — the trailer is where that lives,
 so it stays consistent across workflows and evolves in one place.
 
-The `cd <worktree-path>` in the tmux launch command ensures the
-coordinator starts in the right directory.
+The coordinator's working directory is `<worktree-path>`, which the
+orchestrator passes via the prompt assembled by `build-coord-prompt.py`.
 
 ### 7. Ship path (runs during REAP for tasks that released `done`)
 
