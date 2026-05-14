@@ -33,27 +33,28 @@ git commit -m "feat: add ccg_project_orchestration orchestration submodule"
 
 ## Architecture
 
-The orchestration layer drives a **three-tier tmux hierarchy**. The
+The orchestration layer drives a **three-tier Teams hierarchy**. The
 orchestrator session runs at the top; each claimed task gets its own
-coordinator child; each coordinator fans out to specialist children for
+coordinator team via `TeamCreate`; each coordinator pre-populates
+specialist teammates at create time and fans out by `SendMessage` for
 parallel build/review phases.
 
 ```
 Tier 1: ORCHESTRATOR  (Claude Code session, /orch-start)
   │  Polls taskforge every 20 min for ready tasks assigned to claude_orch.
-  │  Ships finished coordinators as PRs; routes decisions via Telegram.
+  │  Ships finished coordinators as PRs; surfaces decisions via PushNotification.
   │
-  ├── tmux new-window → Tier 2: COORDINATOR  (claude -p, one per task)
+  ├── TeamCreate → Tier 2: COORDINATOR  (Teams teammate, one per task)
   │     │  Runs the selected workflow (six-phase-build, doc-only, etc.)
   │     │  Writes task.attrs.completion; releases lease on finish.
   │     │
-  │     ├── tmux split-pane → Tier 3: SPECIALIST  (claude -p)
+  │     ├── SendMessage → Tier 3: SPECIALIST  (pre-populated teammate)
   │     │     e.g. python-expert: .py files, tests, alembic
   │     │
-  │     └── tmux split-pane → Tier 3: SPECIALIST  (claude -p)
+  │     └── SendMessage → Tier 3: SPECIALIST  (pre-populated teammate)
   │           e.g. frontend-ux / frontend-ui: templates, JS, CSS
   │
-  └── tmux new-window → Tier 2: COORDINATOR  (next task, up to 10 in-flight)
+  └── TeamCreate → Tier 2: COORDINATOR  (next task, up to 10 in-flight)
 ```
 
 **Workflows** are stored in the taskforge DB (`WorkflowVersion.body_template`),
@@ -82,7 +83,8 @@ Contents:
 | `commands/setup-orchestration.md` | Claude Code slash command: idempotent bootstrap |
 | `commands/sync-persona.md` | Claude Code slash command: pull/propose/check agent personas |
 | `docs/periodic-workflow.md` | Canonical orchestrator runtime spec |
-| `docs/tmux-delegation.md` | Three-tier tmux delegation architecture |
+| `docs/teams-delegation.md` | Three-tier Teams delegation architecture |
+| `docs/teams-primitives-reference.md` | `TeamCreate` / `SendMessage` / `TeamDelete` reference |
 | `docs/workflows/README.md` | Workflow library reference and chaining spec |
 | `docs/attrs-conventions.md` | `task.attrs` key conventions consumed by orchestration |
 | `scripts/build-coord-prompt.py` | Coordinator prompt assembler |
@@ -90,7 +92,6 @@ Contents:
 | `scripts/sync_persona.py` | Agent persona sync CLI |
 | `scripts/session-usage-watcher.py` | Chrome CDP session-usage monitor |
 | `scripts/session-usage-check.sh` | Reads session-usage-watcher output |
-| `scripts/telegram-mcp-health.sh` | Telegram MCP plugin health check |
 | `scripts/launch-chrome-debug.sh` | Launch Chrome in debug mode for CDP |
 | `setup.sh` | Thin wrapper: `./scripts/orchestration_setup.sh "$@"` |
 

@@ -8,7 +8,7 @@ Canonical assembly of the four-part coordinator prompt specified in
           SendMessage patterns, checkpoint discipline. ALWAYS prepended.
           Starts with "# " so the assembled prompt never begins with a
           dash (some launchers would parse a leading `-` as an option flag).
-  Part 1  task-fields block: title, description, AC, plan, tmux window.
+  Part 1  task-fields block: title, description, AC, plan, Teams teammate.
   Part 2  workflow body, from .orchestration/workflows/<slug>.md (materialized
           cache), falling back to the taskforge REST API on miss, then
           to docs/workflows/<slug>.md (legacy, deprecated).
@@ -241,7 +241,7 @@ def part1(task: dict, worktree: str, branch: str, window: str) -> str:
         f"You are the coordinator for taskforge task {task['id']}.",
         f"Working directory: {worktree}",
         f"Branch: {branch}",
-        f"Tmux window: {window}",
+        f"Team name: {window}",
         "",
         f"Title: {task['title']}",
         "",

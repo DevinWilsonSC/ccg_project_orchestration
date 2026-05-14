@@ -13,12 +13,11 @@ Exit codes:
 Environment:
   TASKFORGE_API_KEY      required
   TASKFORGE_BASE_URL     default: http://taskforge-prod:8000
-  COORD_WINDOW           tmux window name stored in checkpoint.by_coord
+  COORD_TEAM_NAME        Teams teammate name stored in checkpoint.by_coord
 """
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 
@@ -26,19 +25,14 @@ import httpx
 
 
 def _get_by_coord() -> str:
-    coord_window = os.environ.get("COORD_WINDOW")
-    if coord_window:
-        return coord_window
-    if os.environ.get("TMUX"):
-        try:
-            return subprocess.check_output(
-                ["tmux", "display-message", "-p", "#W"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except Exception:
-            pass
-    return "unknown"
+    # Prefer the new env var, fall back to the legacy COORD_WINDOW for
+    # any wrapper that hasn't been updated yet. tmux-based detection
+    # is gone — coordinators now run as Teams teammates with no tmux.
+    return (
+        os.environ.get("COORD_TEAM_NAME")
+        or os.environ.get("COORD_WINDOW")
+        or "unknown"
+    )
 
 
 def run(task_id: str, phase: str) -> int:

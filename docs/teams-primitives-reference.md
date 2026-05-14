@@ -18,8 +18,8 @@ in-process Claude sessions — they share the same Anthropic account quota, have
 access to the configured MCP servers, and write files in the same worktree as
 the team lead.
 
-Teams replace the tmux-based `tmux split-pane` + `claude -p` delegation
-pattern. The three primitives are:
+Teams replace the legacy tmux-based `tmux split-pane` + `claude -p`
+delegation pattern. The three primitives are:
 
 | Primitive | What it does |
 |---|---|
@@ -310,7 +310,7 @@ session will fall through to the Agent tool or error.
 **Mitigation:** The flag is set in `.claude/settings.json` (project-level),
 so it is inherited by all coordinators and the orchestrator session. If
 Anthropic deprecates or renames the flag, revert path is: reverse the Chunk 0
-PRs to restore tmux delegation (tracked in the pivot plan's risk register).
+restoring tmux delegation would require reintroducing the legacy substrate (not planned).
 
 ### Static specialist list
 
@@ -351,12 +351,12 @@ worktree and resolves seams explicitly before proceeding to REVIEW.
 This flag must be present for `TeamCreate`, `SendMessage`, and `TeamDelete`
 to be available as tools. It is project-level (not `settings.local.json`)
 because every coordinator and orchestrator session that runs from this project
-root needs it — including automated `claude -p` invocations from the tmux
+root needs it — including any legacy automated `claude -p` invocations from a tmux
 launcher during Chunk 0's transition period.
 
 **Deprecation tracking:** If Anthropic GA's the Teams API under a stable name,
 update the flag here and in any workflow bodies that reference it. The revert
-path (restore tmux) is documented in `docs/plans/task-library-and-workflow-pivot.md`
+path (restore tmux) is theoretical only — the pivot plan in `docs/plans/task-library-and-workflow-pivot.md`
 § "Risks".
 
 ---
@@ -369,7 +369,7 @@ path (restore tmux) is documented in `docs/plans/task-library-and-workflow-pivot
 | `SendMessage` | `to` (teammate name), `message` | No (async fan-out) | N/A |
 | `TeamDelete` | `name` (team name) | Yes (waits for graceful stop) | Implicit |
 
-**Coordinator team name:** `coord-<8-char-short-id>` (matches tmux window name
+**Coordinator team name:** `coord-<8-char-short-id>` (matches Teams teammate name
 convention for compatibility with interim monitoring tooling).
 
 **Specialist types (CCG):** `python-expert`, `frontend-ux`, `frontend-ui`,
@@ -384,8 +384,8 @@ teams → lease expiry → revert to TODO → respawn on next tick with checkpoi
 
 | Concern | tmux pattern (legacy) | Teams pattern (current) |
 |---|---|---|
-| Coordinator spawn | `tmux new-window` + `claude -p` | `TeamCreate` + `SendMessage` |
-| Specialist spawn | `tmux split-pane` + `claude -p` | Pre-populated at `TeamCreate` |
+| Coordinator spawn | `TeamCreate` + `claude -p` | `TeamCreate` + `SendMessage` |
+| Specialist spawn | `SendMessage` + `claude -p` | Pre-populated at `TeamCreate` |
 | Completion signal | `/tmp/coord-<id>.done` file | Team task list / reply message |
 | Quota pause | SIGTERM on tmux pane PIDs | `TeamDelete` (graceful) |
 | Nested fan-out | Unlimited depth (any session can tmux) | Single depth (no nested teams) |
