@@ -1169,6 +1169,64 @@ In the worktree:
 **Never** push to `dev` or `main` directly. **Never** run
 `gh pr merge --delete-branch` on a PR whose head is `dev`.
 
+#### 7a. Submodule-touching tasks — sequential ship path
+
+If `task.attrs.completion` contains a `submodule_branch` key (set by the
+coordinator when it committed changes inside `orchestration/`), the task
+touched the submodule. Ship in strict sequence — do **not** merge the
+parent PR until the submodule PR is squash-merged and the resulting SHA
+is captured.
+
+**Step order:**
+
+1. **Open the submodule PR** first:
+   ```bash
+   cd <worktree-path>/orchestration
+   gh pr create \
+     --base main \
+     --head <attrs.completion.submodule_branch> \
+     --title "<task.title> [submodule]" \
+     --body "Submodule change for taskforge task <uuid>.\n\nMust merge before parent repo PR."
+   ```
+   Telegram: `"🔀 Submodule PR opened: <submodule_pr_url> — merging before parent PR"`
+
+2. **Auto-merge the submodule PR** (squash):
+   ```bash
+   gh pr merge <submodule_pr_url> --squash --delete-branch --auto
+   ```
+   Poll until merged:
+   ```bash
+   while [ "$(gh pr view <submodule_pr_url> --json state -q .state)" != "MERGED" ]; do sleep 15; done
+   ```
+
+3. **Capture the post-squash SHA** (the squash creates a new commit on
+   `main` of the submodule repo — this is the SHA the parent must point to):
+   ```bash
+   SUBMODULE_SHA=$(gh pr view <submodule_pr_url> --json mergeCommit -q .mergeCommit.oid)
+   ```
+
+4. **Pin the parent worktree's submodule pointer** to the post-squash SHA:
+   ```bash
+   cd <worktree-path>/orchestration
+   git fetch origin main
+   git checkout "$SUBMODULE_SHA"
+   cd <worktree-path>
+   git add orchestration
+   git commit -m "pin orchestration submodule to post-squash SHA $SUBMODULE_SHA"
+   ```
+
+5. **Continue the normal ship path** from step 4 above (`git push -u
+   origin task/<short-id>-<slug>`, open parent PR, auto-merge parent PR).
+
+   The parent PR body should mention the submodule PR URL and the pinned
+   SHA so reviewers can trace the chain.
+
+**Never** bump the submodule pointer in the task branch (the coordinator
+must not `git add orchestration` in the main repo). The pointer bump
+always happens here in the orchestrator ship path, after the submodule
+PR squash-merges, so the parent always pins to a real commit on
+`submodule:main`.
+
 ### 8. Idle check
 
 If step 2 classified **zero in-flight AND zero fresh AND zero
