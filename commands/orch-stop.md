@@ -14,14 +14,14 @@ loop:
    the stop flag (below) and exit immediately without doing a tick.
 3. Set an in-context flag: `ORCHESTRATOR_STOPPED = true`. Whenever the
    `<<autonomous-loop-dynamic>>` sentinel next fires, check this flag
-   first — if set, reply with `"🛑 Orchestrator stopped."` via Telegram
+   first — if set, reply with `"🛑 Orchestrator stopped."` via PushNotification
    (if the plugin is available) and do nothing else.
 4. If there is currently a task mid-tick (claimed but not released),
    heartbeat it once more and leave the lease to expire naturally — do
    NOT force-release, because the child may still be working. The
    server-side `sweep_expired_leases` job will reclaim it after the
    lease window.
-5. Telegram: `"🛑 Orchestrator loop stopped. In-flight task (if any)
+5. Notify: `"🛑 Orchestrator loop stopped. In-flight task (if any)
    left to finish or expire. Run /orch-start to resume."`
 
 Do not run another tick. Do not reschedule.

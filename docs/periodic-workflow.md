@@ -14,10 +14,10 @@ change — do not let them drift.
 
 **v2 changes (vs v1):**
 - Each tick now has three phases: **reap / heartbeat / top-up**.
-- Per-task work runs as a **coordinator child** launched via tmux +
+- Per-task work runs as a **coordinator team** launched via `TeamCreate` +
   `claude -p` that itself fans out across the phases defined in the
   selected workflow.
-- Up to **3 tasks run concurrently** (lease + `_coordinator_tmux_window`
+- Up to **3 tasks run concurrently** (lease + `_coordinator_team_name`
   are what tell the orchestrator "this task is already in flight").
 - Ship path runs on the **next** tick after the coordinator releases
   — not inline.
@@ -34,13 +34,13 @@ change — do not let them drift.
   legacy alias for best-fit.
 
 **v4 changes (vs v3):**
-- **Tmux-based delegation.** Coordinators launch via `tmux new-window`
+- **Teams-based delegation.** Coordinators launch via `TeamCreate`
   + `claude -p` instead of `Agent(run_in_background=true)`. This gives
   coordinators the full Claude tool set (including Agent, if needed) and
-  lets them spawn specialists in parallel tmux panes via `claude -p`.
-- Three-tier architecture: orchestrator → coordinator (tmux window) →
-  specialists (tmux panes). See `docs/orchestrator/tmux-delegation.md`.
-- `attrs._coordinator_task_id` replaced by `attrs._coordinator_tmux_window`.
+  fan out to pre-populated specialist teammates via parallel `SendMessage` calls.
+- Three-tier architecture: orchestrator → coordinator (Teams teammate) →
+  specialists (pre-populated teammates). See `docs/teams-delegation.md`.
+- `attrs._coordinator_task_id` replaced by `attrs._coordinator_team_name`.
 - **Ship-on-status.** The ship signal is Taskforge terminal status +
   `attrs.completion`, not the FS marker. Per Part 3 of the coord
   prompt, `release_task` is the LAST meaningful step (after commit,
@@ -49,9 +49,9 @@ change — do not let them drift.
   for 10–60s flushing final output. `/tmp/coord-<short-id>.done` is
   now only a crash-detection signal (marker present + task still
   `in_progress` = coord exited without releasing) and a cleanup
-  trigger for tempfiles / tmux window / worktree.
+  trigger for tempfiles / Teams teammate / worktree.
 - Coordinators survive orchestrator context resets — they run as
-  independent `claude -p` processes in tmux windows.
+  independent `claude -p` processes in Teams teammates.
 - Orchestrator can author new workflow files at intake when none fits,
   and auto-files an owner-review task.
 - Six seeded workflows: `six-phase-build`, `lightweight`, `infra-change`,
@@ -79,7 +79,7 @@ change — do not let them drift.
 - **Quota-pause now SIGTERMs in-flight coords.** Coordinators share the
   orchestrator's Anthropic quota and die uncontrollably at 100% anyway —
   a controlled SIGTERM on §0a pause preserves partial work for resume.
-  Worktrees and tmux windows are preserved; only the `claude -p` processes
+  Worktrees and Teams teammates are preserved; only the `claude -p` processes
   are killed.
 - **Resumable bucket.** A new §2 classification for `in_progress` tasks
   with no live coord window and a non-empty `attrs.checkpoint.phases_completed`.
@@ -110,7 +110,7 @@ fans out tasks manually.
 After: **Taskforge is the driver.** A Claude Code session running the
 `/orch-start` command wakes every 20 min, picks up tasks explicitly
 queued for `claude_orch`, delegates each to a six-phase coordinator
-child, ships completed work as a PR, and reports progress on Telegram.
+child, ships completed work as a PR, and reports progress via PushNotification.
 The owner queues work by setting `status=ready` +
 `assigned_to_id=claude_orch` on a task — that's it.
 
@@ -133,7 +133,7 @@ transitions it to `in_progress`. This means `in_progress` always means
 
 **Resumable tasks (`in_progress` + checkpoint + no window).** An
 `in_progress` task with `attrs.checkpoint.phases_completed` non-empty and
-no live `_coordinator_tmux_window` is classified Resumable in §4a and
+no live `_coordinator_team_name` is classified Resumable in §4a and
 picked up for respawn during TOP UP (§4c), not released. This applies only
 to tasks the orchestrator itself claimed — it never touches `in_progress`
 tasks assigned to other actors. The "predictability outranks throughput"
@@ -173,7 +173,7 @@ some are in `attrs`.
 | `attrs.completion` | attr | written by coordinator | — | Short summary of what shipped |
 | `attrs.review_findings` | attr | written by coordinator (only when findings persist after the in-tick fix-up round) | — | Surfaced in the PR body so the owner can judge in review |
 | `attrs.pr_url` | attr | written by orchestrator | — | PR link for owner review |
-| `attrs._coordinator_tmux_window` | attr | **orchestrator-internal** — written when launching the tmux coordinator; cleared on reap | — | The tmux window name (e.g. `coord-b77cc8a9`) for the coordinator `claude -p` process working this task. Presence of a stale window name on a fresh task signals an orphan — reclaim and clear. Underscore-prefixed per attrs-conventions. |
+| `attrs._coordinator_team_name` | attr | **orchestrator-internal** — written when launching the coordinator team; cleared on reap | — | The Teams teammate name (e.g. `coord-b77cc8a9`) for the coordinator `claude -p` process working this task. Presence of a stale window name on a fresh task signals an orphan — reclaim and clear. Underscore-prefixed per attrs-conventions. |
 | `attrs.workflow_version_id` | attr | **orchestrator-internal** — written at intake when a workflow version is selected | — | UUID FK to `workflow_versions.id`. Persists across coordinator restarts; used by the orchestrator to verify checkpoint freshness (still the published version?) without parsing the nested `checkpoint` object. |
 
 **`repo_path` inheritance.** The orchestrator calls the
@@ -183,19 +183,19 @@ some are in `attrs`.
 1. The task's own `attrs.repo_path` if set and non-empty.
 2. Otherwise, the closest `ltree` ancestor (highest `nlevel`) whose
    `attrs.repo_path` is set and non-empty.
-3. Otherwise, `null` → `waiting_on_human` + Telegram.
+3. Otherwise, `null` → `waiting_on_human` + PushNotification.
 
 This means you can set `repo_path` once on an umbrella/parent task and
 every descendant picked up by the orchestrator inherits it. Explicit
 per-task `repo_path` still wins over any inherited value.
 
-Missing resolved `repo_path` → `waiting_on_human` + Telegram. Do not
+Missing resolved `repo_path` → `waiting_on_human` + PushNotification. Do not
 guess.
 
 Missing `description` or `acceptance_criteria` at intake → the
 orchestrator **auto-generates** both from the task title and available
 context, patches the fields on the task row via REST PATCH, leaves an
-`add_note` audit entry, and Telegrams the owner so they can review and
+`add_note` audit entry, and notifies the owner via PushNotification so they can review and
 edit the draft if needed. The coordinator then runs against the
 auto-generated text. This avoids the ticket thrashing observed when
 empty-description tasks reach the coordinator with nothing to scope
@@ -231,11 +231,11 @@ the pause was triggered.
   **minimal-tick** — heartbeat all in-flight tasks (to keep 30-min
   leases alive), compute `DELAY = min(3600, max(60, until_epoch + 60 -
   now))`, call `ScheduleWakeup(DELAY)`. End tick immediately — skip
-  §0b through §11. No Telegram noise on chained hops.
+  §0b through §11. No notification noise on chained hops.
 - **File present, but quota < 94% or `now >= until_epoch`:** delete
   the file and proceed with a full tick (§0a through §11).
 
-This state machine eliminates the repeated Telegram "⏸ quota" pings
+This state machine eliminates the repeated PushNotification "⏸ quota" pings
 and the full classify/top-up overhead on each 1-hour chained wakeup
 that occurs when `RESET_EPOCH` is more than 3600s away.
 
@@ -258,21 +258,21 @@ that occurs when `RESET_EPOCH` is more than 3600s away.
   3. **SIGTERM all in-flight coordinator processes.** Coordinators share
      the orchestrator's Anthropic quota and will be killed at 100% anyway
      — a controlled SIGTERM preserves partial work for resume. For each
-     in-flight coord: enumerate pane PIDs via `tmux list-panes -F
+     in-flight coord: enumerate teammate handles via `TeamGet` (the team holds the lease — keeping it alive across the pause is sufficient).
      '#{pane_pid}'`, SIGTERM + 10 s grace + SIGKILL survivors. Worktrees
-     are preserved in all cases. The tmux window is conditionally
+     are preserved in all cases. The Teams teammate is conditionally
      preserved: if the coord has a checkpoint (`phases_completed` non-empty),
      preserve the window (for `respawn-window -k` on resume) and write
-     `.done` + exit `99`; otherwise kill the window with `tmux kill-window`
-     and skip `.done`/`.exit` so Fresh top-up can use `tmux new-window`
+     `.done` + exit `99`; otherwise kill the window with `TeamDelete`
+     and skip `.done`/`.exit` so Fresh top-up can use `TeamCreate`
      cleanly on the next tick. See `orch-start.md §0a` for the exact bash.
-  4. Clear `attrs._coordinator_tmux_window` for each SIGTERM'd task
+  4. Clear `attrs._coordinator_team_name` for each SIGTERM'd task
      (one PATCH per task, AFTER processes are dead). This makes the next
      tick classify the task as Resumable (checkpoint present) or Fresh
      (no checkpoint) rather than In-flight.
   5. Write `RESET_EPOCH` to `/tmp/orch-quota-paused-until`.
   6. Compute `DELAY = min(3600, max(60, RESET_EPOCH + 60 - now))`.
-  7. Telegram: `"⏸ Session quota at N% — pausing. SIGTERMed K
+  7. Notify: `"⏸ Session quota at N% — pausing. SIGTERMed K
      coordinators; will respawn on resume (~ETA)."` (sent once only).
   8. `ScheduleWakeup(DELAY)`. End tick.
 
@@ -286,14 +286,14 @@ tick. For a 4.5 h reset: ≤5 hops × ~15s overhead vs 5 × full-tick.
 
 Before any work, the orchestrator estimates its session's context
 usage. Long-running loops accumulate context across ticks (reap output,
-coordinator summaries, Telegram messages, notes). If the context fills
+coordinator summaries, PushNotification messages, notes). If the context fills
 up mid-tick, work can be lost or compacted at an awkward point.
 
 - **Below 80%:** no action — proceed to REAP.
 - **80–94%:** `add_note` warning (`"context usage ~<N>%"`). Proceed
-  but keep notes and Telegram terse.
+  but keep notes and PushNotification terse.
 - **≥95%:** graceful shutdown — heartbeat all in-flight tasks once,
-  Telegram `"⚠ Orchestrator stopping — context at ~<N>%"`, do NOT
+  PushNotification `"⚠ Orchestrator stopping — context at ~<N>%"`, do NOT
   reschedule. The owner runs `/orch-start` in a new session.
 
 The gate runs before auth (step 1) so a near-limit session doesn't
@@ -307,7 +307,7 @@ REAP classification is a union of three `list_tasks` queries (all
 filtered by `assigned_to=claude_orch`): `status=ready`,
 `status=in_progress`, and `status in (done, blocked,
 waiting_on_human)`. Results are filtered client-side on
-`attrs._coordinator_tmux_window` being set — the third bucket in
+`attrs._coordinator_team_name` being set — the third bucket in
 particular would otherwise miss coordinators that called `release_task`
 (which transitions the task out of `in_progress`) before the
 orchestrator reaps, stranding the branch work.
@@ -319,36 +319,36 @@ for 10–60 s emitting final narrative; per Part 3 of the coord prompt,
 `attrs.completion`), so once status is terminal the branch is frozen
 and shippable. Route on this signal:
 
-- **Released** — `_coordinator_tmux_window` set AND `task.status ∈
+- **Released** — `_coordinator_team_name` set AND `task.status ∈
   {done, blocked, waiting_on_human}` AND `attrs.completion` present.
   Read the final non-empty line from `/tmp/coord-<short-id>.log` for
   the `RELEASED <status>` marker; it's diagnostic only (used for
   prompt-tuning notes) — do NOT block on it.
   - `done` → **full ship path** (§7), auto-merge.
   - `blocked` / `waiting_on_human` → **partial-ship path** (§7 steps
-    1–5), push branch + open PR, no auto-merge; Telegram the blocker
+    1–5), push branch + open PR, no auto-merge; PushNotification the blocker
     with PR URL.
-  After routing, clear `_coordinator_tmux_window` to free the slot.
+  After routing, clear `_coordinator_team_name` to free the slot.
 
-- **Crashed** — `_coordinator_tmux_window` set AND
+- **Crashed** — `_coordinator_team_name` set AND
   `/tmp/coord-<short-id>.done` exists AND `task.status == in_progress`.
   Apply the checkpoint guard (see `orch-start.md` §3b): if
   `attrs.checkpoint.phases_completed` is non-empty, take the resume path
   (no release, clear window attr, partial cleanup, queue for next-tick
   respawn); otherwise fall through to last-resort salvage (`release_task
-  blocked`, partial-ship, Telegram, self-improvement task).
+  blocked`, partial-ship, PushNotification, self-improvement task).
 
-- **In-flight** — `_coordinator_tmux_window` set, neither of the above.
+- **In-flight** — `_coordinator_team_name` set, neither of the above.
   Coordinator is still working. Heartbeat in §4b.
 
-- **Fresh** — `_coordinator_tmux_window` unset (or both the `.done`
-  file and tmux window are gone) AND (`attrs.checkpoint` absent OR
+- **Fresh** — `_coordinator_team_name` unset (or both the `.done`
+  file and Teams teammate are gone) AND (`attrs.checkpoint` absent OR
   `attrs.checkpoint.phases_completed` empty). Joins top-up candidates
   in §4c. **Legacy**: tasks with the old `attrs._coordinator_task_id`
   (Agent-tool era, v3) are treated as fresh — clear the stale attr on
   reclaim.
 
-- **Resumable** — `_coordinator_tmux_window` unset (or named window gone),
+- **Resumable** — `_coordinator_team_name` unset (or named window gone),
   `attrs.checkpoint.phases_completed` non-empty, `task.status ∈
   {ready, in_progress}`. Joins top-up candidates in §4c with priority
   over Fresh tasks. Respawned via `build-coord-prompt.py --resume
@@ -360,7 +360,7 @@ and shippable. Route on this signal:
 
 Post-reap cleanup: after all released/crashed tasks are handled, sweep
 `/tmp/coord-*.done` files whose corresponding tasks no longer have
-`_coordinator_tmux_window` set and remove tempfiles + kill the tmux
+`_coordinator_team_name` set and remove tempfiles + `TeamDelete` the
 window. See `orch-start.md` §3c for the exact steps.
 
 ### 4b. HEARTBEAT
@@ -395,9 +395,9 @@ blocker, by `status`:
 |---|---|
 | `done` | Satisfied, continue checking. |
 | `ready` or `in_progress` | Blocker already in motion — **defer** the dependent (skip this tick, do not consume a slot, do not claim). |
-| `todo` | **Auto-queue** the blocker (`update_task(status=ready, assigned_to_id=claude_orch)`). Telegram: `"🔗 Auto-queued <blocker-short> because it blocks <dep-short>"`. **Defer** the dependent. |
-| `blocked` / `waiting_on_human` | Cannot auto-queue — these need owner attention. Telegram: `"⚠ <dep-short> waiting on <blocker-short> (<status>) — cannot auto-queue"`. **Defer** the dependent. |
-| `cancelled` | The dependency edge points at a cancelled task. Telegram: `"⛔ <dep-short> depends on <blocker-short> which was cancelled — remove the dependency or reopen the blocker"`. **Defer**. |
+| `todo` | **Auto-queue** the blocker (`update_task(status=ready, assigned_to_id=claude_orch)`). Notify: `"🔗 Auto-queued <blocker-short> because it blocks <dep-short>"`. **Defer** the dependent. |
+| `blocked` / `waiting_on_human` | Cannot auto-queue — these need owner attention. Notify: `"⚠ <dep-short> waiting on <blocker-short> (<status>) — cannot auto-queue"`. **Defer** the dependent. |
+| `cancelled` | The dependency edge points at a cancelled task. Notify: `"⛔ <dep-short> depends on <blocker-short> which was cancelled — remove the dependency or reopen the blocker"`. **Defer**. |
 
 If every blocker is `done`, the candidate is **eligible** — proceed
 with the per-task steps below. If any blocker is not done, the
@@ -429,10 +429,10 @@ walk is therefore guaranteed to terminate.
 
 3. **Description gate:** if `task.description` is null or blank,
    synthesize from title + context, PATCH the task, `add_note`, and
-   Telegram the owner. **Acceptance-criteria gate:** if
+   PushNotification the owner. **Acceptance-criteria gate:** if
    `task.acceptance_criteria` is null or blank, synthesize from the
    (now non-blank) description, PATCH the task, `add_note`, and
-   optionally Telegram. Both gates proceed (do not skip or defer) —
+   optionally PushNotification. Both gates proceed (do not skip or defer) —
    see `orch-start.md` §6b for the exact synthesis and PATCH steps.
 4. Create worktree. Branch naming scheme: `task/<short-id>-<slug>`
    (where `short-id` = first 8 chars of the task UUID, `slug` = first 4
@@ -446,29 +446,29 @@ walk is therefore guaranteed to terminate.
    `docs/orchestrator/workflows/`). Author a draft on structural miss (see
    `orch-start.md` §6b-workflow). Write the selected
    `workflow_versions.id` into `attrs.workflow_version_id`.
-6. Launch the **coordinator child** via `tmux new-window -n
+6. Launch the **coordinator child** via `TeamCreate -n
    "coord-<short-id>"` + `claude -p` with the coordinator prompt
    assembled from the task-fields block + verbatim body of the selected
    workflow version (`orch-start.md` §6d). See
-   `docs/orchestrator/tmux-delegation.md` for the exact launch command.
-7. Write the tmux window name (`coord-<short-id>`) into
-   `attrs._coordinator_tmux_window`.
+   `docs/teams-delegation.md` for the exact launch contract.
+7. Write the team name (`coord-<short-id>`) into
+   `attrs._coordinator_team_name`.
 
 The orchestrator does **not** wait for the coordinator. It goes back
 to sleep via `ScheduleWakeup`; the next tick reaps.
 
 ### Orphan handling
 
-If `_coordinator_tmux_window` points to a tmux window that no longer
-exists (e.g., tmux session killed or machine restarted), treat the
+If `_coordinator_team_name` points to a Teams teammate that no longer
+exists (e.g., orchestrator process died or machine restarted), treat the
 task as **fresh** — the orphaned `claude -p` process died with its
-tmux session. Taskforge's lease will expire within 30 min and
+orchestrator session. Taskforge's lease will expire within 30 min and
 `sweep_expired_leases` will revert it to TODO if not reclaimed. On
 reclaim during top-up, clear the stale window name.
 
 Note: coordinators can survive orchestrator session context resets
-because they run as independent processes in tmux windows. If the
-orchestrator ends but the tmux session stays alive, coordinators
+because they run as independent processes in Teams teammates. If the
+orchestrator ends but the Claude Code session stays alive, coordinator teams
 continue to completion and their `.done` files will be waiting for
 the next orchestrator session to reap.
 
@@ -476,12 +476,12 @@ the next orchestrator session to reap.
 
 ## 5. Coordinator invocation
 
-Each claimed task spawns one coordinator child in a tmux window via
+Each claimed task spawns one coordinator child in a Teams teammate via
 `claude -p`. **Resumable tasks** reuse the existing `coord-<short>`
-window slot via `tmux respawn-window -k` (dead panes from the previous
+team slot via `TeamCreate` re-bind (dead teammates from the previous
 run are replaced) and pass `--resume --workflow <attrs.checkpoint.workflow>`
 to `build-coord-prompt.py` so the coordinator restarts from its last
-checkpoint phase. Fresh tasks use `tmux new-window` as before. See
+checkpoint phase. Fresh tasks use `TeamCreate` as before. See
 `orch-start.md` §6d for the exact commands. The coordinator is a full
 Claude session (model opus for non-trivial tasks, sonnet for lightweight)
 whose prompt is
@@ -490,7 +490,7 @@ composed of four parts:
 - **Part 0 — single-turn session guidance.** Always first. States
   that `claude -p` is single-turn (no `ScheduleWakeup`, no resume,
   no wake-up), mandates the shell-poll pattern for "wait for
-  `.done`" synchronization, and requires every `tmux split-pane` to
+  `.done`" synchronization, and requires every `SendMessage` to
   pass `-t "coord-<short-id>"` so specialists land in the coord's
   own window rather than the orchestrator's active pane. Without
   this preamble, opus coordinators have been observed to
@@ -502,7 +502,7 @@ composed of four parts:
   sidestep this; do not restructure without preserving that
   property.
 - **Part 1 — task-fields block.** Title, description, acceptance
-  criteria, plan, plus the coord's own tmux window name
+  criteria, plan, plus the coord's own Teams teammate name
   (`coord-<short-id>`) so Part 0's `-t` rule has a concrete target.
 - **Part 2 — workflow body.** The verbatim body of the selected
   workflow file from the workflow library
@@ -619,7 +619,7 @@ workflow can read (but not modify) artifacts from earlier workflows.
 | Git safety (fetch/merge origin/dev) | — | ✓ |
 | Conflict resolution escalation | — | ✓ |
 | `git push` / `gh pr create` | — | ✓ |
-| Telegram progress chatter | — | ✓ |
+| PushNotification progress chatter | — | ✓ |
 | Lease heartbeat | — | ✓ |
 | Idle/auth stop conditions | — | ✓ |
 
@@ -689,7 +689,7 @@ creating a conflict. The check is cheap; skipping it is not safe.
      the full `alembic heads` + `alembic history --verbose` output.
    - Sets `attrs.alembic_heads_conflict` to the raw `alembic heads`
      output so the owner sees the conflict at a glance.
-   - The orchestrator Telegram-notifies the owner via the standard
+   - The orchestrator PushNotification-notifies the owner via the standard
      blocked notification path.
 
 **If single-head:** proceed to `pytest` normally.
@@ -707,7 +707,7 @@ not loop further; iterating to convergence is the owner's call.
 
 At peak: 10 coordinator children × up to 3 parallel BUILD specialists
 per coordinator = **up to 30 concurrent `claude -p` processes** across
-all tmux panes. Supported by the tmux + `claude -p` delegation model
+all teammates. Supported by the Teams + `SendMessage` delegation model
 (each pane is an independent OS process). The orchestrator session
 itself does not hold these as Agent children — each coordinator is
 an independent `claude -p` process.
@@ -763,13 +763,13 @@ High-level:
    `gh pr merge <url> --squash --delete-branch --auto`. `--auto` merges
    once required status checks pass; with no required checks it merges
    immediately. Auto-merge runs on the task branch PR only — never on
-   a `dev`-headed PR. Telegram: `"🔀 PR opened + auto-merge queued:
+   a `dev`-headed PR. Notify: `"🔀 PR opened + auto-merge queued:
    <url>"`.
 
    **Partial-ship path (released `blocked` / `waiting_on_human`, or
    timeout-inferred `blocked`):** SKIP auto-merge. The PR stays open at
    `dev` so the owner can review the partial work and decide what to
-   do. Telegram is the blocker notification from §4a (includes the PR
+   do. PushNotification is the blocker notification from §4a (includes the PR
    URL). The remote branch stays until the owner merges or closes the
    PR.
 7. Prune local worktree. Remote branch is deleted by
@@ -829,7 +829,7 @@ resolved. Escalation order:
    `orch-start.md` §7 for the exact steps.
 
 4. **Escalation.** Any specialist aborts → `git merge --abort`, task →
-   `blocked`, `add_note` with file list + diff summary, Telegram the
+   `blocked`, `add_note` with file list + diff summary, PushNotification the
    owner with file list. Task stays blocked until owner resolves
    manually or replies with guidance the orchestrator can apply next
    tick.
@@ -839,24 +839,23 @@ escalate.
 
 ---
 
-## 9. Human-in-the-loop via Telegram
+## 9. Human-in-the-loop via PushNotification
 
-Channel: the Claude Code Telegram plugin
-(`mcp__plugin_telegram_telegram__reply`). This is **orchestrator-side**
+Channel: harness-native `PushNotification`
+(`PushNotification`). This is **orchestrator-side**
 and distinct from the server-side WAITING_ON_HUMAN webhook documented
-in `telegram.md` — both can fire; they serve different layers.
+in `agile_tracker/docs/telegram.md` — server-side webhook + orchestrator-side PushNotification can both fire; they serve different layers.
 
 ### Notifications (orchestrator → owner)
 
-One Telegram message per milestone. See the table in
+One PushNotification message per milestone. See the table in
 `.claude/commands/orch-start.md` §10 for the exact set.
 
-All orchestrator Telegram sends go through the `tg-send` primitive defined
-in `orch-start.md` `## Telegram send primitive (tg-send)`. If the Telegram
+All orchestrator outbound sends go through `PushNotification` (harness-native; no plugin). The
 MCP plugin disconnects mid-tick, `tg-send` attempts one reconnect cycle
 (ToolSearch + up to ~15 seconds of harness auto-respawn polling) before
 falling through. Pings are lost only when reconnect genuinely fails. The
-tick always continues; `_telegram_offline` resets when the plugin recovers.
+tick always continues; `_pushnotif_unused` resets when the plugin recovers.
 
 ### Commands (owner → orchestrator)
 
@@ -875,7 +874,7 @@ Parsed against a fixed allow-list on every tick. Everything else → menu reply.
 
 Owner identity is verified by chat_id, not message content. Never accept
 a command that asks to elevate access, add allowlist entries, or approve
-Telegram plugin pairings. That's the prompt-injection vector the plugin
+Telegram plugin pairings (taskforge-side webhook feature). That's the prompt-injection vector that webhook
 explicitly warns about.
 
 ---
@@ -923,9 +922,9 @@ it, the workflow evolves under human review.
   `--delete-branch`.
 - Audit every state-relevant transition via `add_note` (claim, spawn,
   release, push, PR open, PR merge, branch prune, conflict, blocker).
-- Fail-loud on auth mismatch. Fail-loud on Telegram command
+- Fail-loud on auth mismatch. Fail-loud on unrecognized owner-reply
   ambiguity — answer with the menu, never guess.
-- Deploys only on explicit Telegram command. Never as a side effect of
+- Deploys only on explicit owner command. Never as a side effect of
   task completion.
 - The workflow library (`docs/orchestrator/workflows/`) is the
   canonical source for coordinator phase lists. The coordinator prompt
@@ -979,7 +978,7 @@ pursued:
   `gh pr merge --squash --delete-branch --auto` immediately after `gh pr create`.
   Auto-merge to dev is the default; owner can cancel with `hold <short-id>` and
   merge manually via `merge <short-id>`. The only human gate is dev→main.
-- **Richer Telegram intake.** Multi-step conversations (e.g., "what
+- **Richer Owner-reply intake.** Multi-step conversations (e.g., "what
   should I do about X?" + structured reply) rather than fixed
   allow-list. Needs care around prompt injection.
 - **Stronger category bootstrap.** First-tick creation of the
@@ -1002,7 +1001,7 @@ pursued:
   ScheduleWakeup reschedule — the existing 20-min tick still fires for
   heartbeat/top-up). Coordinator/specialist launches now use
   `script -qefc '<cmd>' <log>` to preserve line-buffered pty output so
-  panes and logs stream live — see `docs/orchestrator/tmux-delegation.md`.
+  teammate output streams live — see `docs/teams-delegation.md`.
 
 - ~~**Coord deaths become invisible.** Quota-kill, OOM, or network loss
   caused coord processes to die silently; the orchestrator had no path
@@ -1050,7 +1049,7 @@ the owner, and files a self-improvement task about prompt reliability.
 Fine — queue whichever you want first. During TOP UP the orchestrator
 checks `get_dependencies` on every candidate and, for any `todo`
 blocker, promotes it to `ready` + `claude_orch` automatically
-(Telegram notifies). The dependent is deferred for this tick; on the
+(PushNotification notifies). The dependent is deferred for this tick; on the
 next tick the blocker is the fresh candidate, runs end-to-end, and on
 the tick after that (once the blocker's coordinator has released
 `done`) the dependent is eligible. Blockers in `blocked` /

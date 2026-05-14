@@ -72,7 +72,7 @@ This flag must be present in every Claude session that calls
 `settings.local.json`) so automated `claude -p` invocations from
 scripts and CI inherit it automatically. If Anthropic GA's the Teams
 API under a new name, update the flag here and in any workflow bodies
-that reference it. The revert path (restore tmux) is documented in
+that reference it. Teams is the current substrate; tmux delegation has been removed.
 `docs/plans/task-library-and-workflow-pivot.md` § "Risks".
 
 ---
@@ -177,7 +177,7 @@ exists) or Fresh (if not), and respawned on the next tick.
 
 The 8-char short-id is the first 8 hex characters of the Taskforge task
 UUID. It matches the worktree path suffix (`task-6be5def1`) and the
-legacy tmux window name — monitoring tooling keys on this pattern.
+legacy Teams teammate name — monitoring tooling keys on this pattern.
 
 ### Teammate names within a team
 
@@ -476,7 +476,7 @@ coordinator should:
 
 1. Add a note: "TeamCreate unavailable — CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS not set."
 2. Release as `blocked`.
-3. Do NOT fall back to tmux delegation inline — that would create
+3. Do NOT fall back to ad-hoc tmux delegation inline — that would create
    untracked sub-processes that the orchestrator cannot REAP.
 
 ### 8d. Budget exhausted mid-workflow
@@ -548,8 +548,8 @@ pause (checkpoint written, partial work preserved).
 
 | Concern | tmux (legacy, deleted) | Teams (current) |
 |---|---|---|
-| Coordinator spawn | `tmux new-window` + `claude -p` | `TeamCreate` + `SendMessage` |
-| Specialist spawn | `tmux split-pane` + `claude -p` | Pre-populated at `TeamCreate` |
+| Coordinator spawn | `TeamCreate` + `claude -p` | `TeamCreate` + `SendMessage` |
+| Specialist spawn | `SendMessage` + `claude -p` | Pre-populated at `TeamCreate` |
 | Completion signal | `/tmp/coord-<id>.done` file poll | `task.status` terminal check |
 | Quota pause | SIGTERM on tmux pane PIDs | `TeamDelete` (graceful) |
 | Nested fan-out | Unlimited depth | Single depth (no nested teams) |
@@ -560,7 +560,7 @@ pause (checkpoint written, partial work preserved).
 | Spec doc | `docs/tmux-delegation.md` (deleted) | **This document** |
 
 The tmux delegation layer has been removed. Do not reintroduce
-`tmux split-pane` / `claude -p` patterns for coordinator or specialist
+`SendMessage` / `claude -p` patterns for coordinator or specialist
 launches. If the Teams flag is unavailable, release the task as
 `blocked` rather than falling back to tmux.
 
@@ -590,7 +590,7 @@ allowed to complete or be drained before the bump lands.
 The `attrs.workflow_version_id` guard in `§6d` of `orch-start.md`
 catches the remaining edge case: if a Resumable task's checkpoint
 recorded the old `workflow_version`, the orchestrator blocks the
-`--resume` spawn and surfaces a Telegram alert for manual review.
+`--resume` spawn and surfaces a PushNotification alert for manual review.
 
 ---
 
