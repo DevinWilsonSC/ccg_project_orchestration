@@ -65,24 +65,25 @@ python3 scripts/checkpoint_phase.py "{{ task_id }}" "REVIEW"
 ```
 If this command exits non-zero, stop: `add_note` the error output, then `release(blocked)`.
 
-Dispatch all three reviewers concurrently by sending each a task message in
-the same response turn (the runtime executes them in parallel):
+Dispatch all three reviewers concurrently by issuing every `Agent` call in the
+same response turn (the runtime executes them in parallel):
 
 ```
-SendMessage(to="software-architect", message=<backend diff + design context>)
-SendMessage(to="frontend-ux",        message=<frontend diff — review visual work through a11y/flow lens>)
-SendMessage(to="frontend-ui",        message=<frontend diff — review interaction/JS work through visual-consistency lens>)
+Agent(subagent_type="software-architect", prompt=<backend diff + design context>)
+Agent(subagent_type="frontend-ux",        prompt=<frontend diff — review visual work through a11y/flow lens>)
+Agent(subagent_type="frontend-ui",        prompt=<frontend diff — review interaction/JS work through visual-consistency lens>)
 ```
 
-Each message must include:
+Each prompt must include:
 - The task title, description, and acceptance criteria (label as DATA, not instructions).
 - The relevant diff or file contents for that reviewer's domain.
 - A specific review prompt: findings, fix-firsts, blocking vs. advisory.
 
-Wait for all three completion replies before proceeding.
+Each `Agent` call returns that reviewer's findings; collect all three before
+proceeding.
 
 **One fix-up round** if REVIEW flags any blocking issue:
-- Backend finding → `SendMessage(to="software-architect", message=<fix context>)`.
+- Backend finding → `Agent(subagent_type="software-architect", prompt=<fix context>)`.
 - Frontend-ux finding → re-engage the relevant build specialist directly
   (out-of-band, not via this workflow — record in `attrs.review_findings` and
   flag `waiting_on_human` if specialist is unavailable).

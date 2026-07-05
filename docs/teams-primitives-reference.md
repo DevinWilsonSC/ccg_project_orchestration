@@ -1,12 +1,17 @@
-# Claude Code Teams Primitives — Reference
+# Claude Code Teams Primitives — Reference (HISTORICAL)
 
-**Status:** v1, 2026-04-24. Experimental feature.
-**Scope:** Quick-reference for workflow authors using `TeamCreate`, `SendMessage`,
-and `TeamDelete` to implement coordinator → specialist delegation.
-**Depends on:** `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in env (see below).
-**See also:** `orchestration/docs/teams-delegation.md` for the full CCG usage
-spec; `orchestration/docs/tmux-delegation.md` for the legacy substrate this
-replaces.
+> **Historical / superseded by the `orch-v2-rebaseline`.** Orchestration v2 no
+> longer uses the Teams primitives (`TeamCreate` / `SendMessage` / `TeamDelete`)
+> to launch or fan out delegated units. Fan-out is now **native**: typed
+> subagents via the `Agent` tool, multi-phase pipelines via the `Workflow` tool,
+> and background agents. For the current contract see
+> **`orchestration/docs/native-dispatch.md`**. This reference is retained only as
+> provenance for the retired mechanism.
+
+**Status:** v1, 2026-04-24 (retired). Experimental feature.
+**Scope:** Quick-reference for the retired `TeamCreate`, `SendMessage`, and
+`TeamDelete` coordinator → specialist delegation.
+**Superseded by:** `orchestration/docs/native-dispatch.md`.
 
 ---
 

@@ -10,7 +10,7 @@ for AI-native task coordination.
 
 ```bash
 # 1. Add as a submodule (from your project root):
-git submodule add git@github.com:DevinWilsonSC/ccg_project_orchestration.git orchestration
+git submodule add https://github.com/DevinWilsonSC/ccg_project_orchestration.git orchestration
 git submodule update --init --recursive
 
 # 2. Bootstrap (creates .orchestration/, symlinks .claude/commands/, stamps CLAUDE.md):
@@ -33,29 +33,32 @@ git commit -m "feat: add ccg_project_orchestration orchestration submodule"
 
 ## Architecture
 
-The orchestration layer drives a **three-tier Teams hierarchy**. The
-orchestrator session runs at the top; each claimed task gets its own
-coordinator team via `TeamCreate`; each coordinator pre-populates
-specialist teammates at create time and fans out by `SendMessage` for
-parallel build/review phases.
+The orchestration layer drives a **native delegation tree** (orch-v2). The
+orchestrator session runs at the top; each claimed task is dispatched as a
+**native delegated unit** — a typed subagent for trivial tasks, or a
+coordinator unit that runs the selected workflow via the **Workflow tool** and
+fans out to typed specialist subagents (the `Agent` tool) for parallel
+build/review phases. Long units run as **background agents** so the loop stays
+responsive. There are no tmux windows, no `claude -p` children, and no Teams
+teammates.
 
 ```
-Tier 1: ORCHESTRATOR  (Claude Code session, /orch-start)
+ORCHESTRATOR  (Claude Code session, /orch-start)
   │  Polls taskforge every 20 min for ready tasks assigned to claude_orch.
-  │  Ships finished coordinators as PRs; surfaces decisions via PushNotification.
+  │  Ships finished units as PRs to dev; surfaces decisions via PushNotification.
   │
-  ├── TeamCreate → Tier 2: COORDINATOR  (Teams teammate, one per task)
-  │     │  Runs the selected workflow (six-phase-build, doc-only, etc.)
-  │     │  Writes task.attrs.completion; releases lease on finish.
-  │     │
-  │     ├── SendMessage → Tier 3: SPECIALIST  (pre-populated teammate)
-  │     │     e.g. python-expert: .py files, tests, alembic
-  │     │
-  │     └── SendMessage → Tier 3: SPECIALIST  (pre-populated teammate)
-  │           e.g. frontend-ux / frontend-ui: templates, JS, CSS
+  ├── Agent(subagent_type=<persona>) ─────────── trivial task → one subagent
   │
-  └── TeamCreate → Tier 2: COORDINATOR  (next task, up to 10 in-flight)
+  └── Agent(subagent_type="coordinator", background) ── non-trivial task
+        │  Runs the selected workflow (six-phase-build, doc-only, …) via the
+        │  Workflow tool. Writes task.attrs.completion; releases the lease.
+        │
+        ├── Agent(subagent_type="python-expert")   .py files, tests, alembic
+        └── Agent(subagent_type="frontend-ux" / "frontend-ui")  JS / CSS
+  … up to ORCH_MAX_IN_FLIGHT (default 10) units in flight.
 ```
+
+See `docs/native-dispatch.md` for the full delegation spec.
 
 **Workflows** are stored in the taskforge DB (`WorkflowVersion.body_template`),
 materialized locally at `.orchestration/workflows/<slug>.md` on pull.
@@ -82,12 +85,13 @@ Contents:
 | `commands/orch-stop.md` | Claude Code slash command: stop the loop |
 | `commands/setup-orchestration.md` | Claude Code slash command: idempotent bootstrap |
 | `commands/sync-persona.md` | Claude Code slash command: pull/propose/check agent personas |
-| `docs/periodic-workflow.md` | Canonical orchestrator runtime spec |
-| `docs/teams-delegation.md` | Three-tier Teams delegation architecture |
-| `docs/teams-primitives-reference.md` | `TeamCreate` / `SendMessage` / `TeamDelete` reference |
+| `docs/periodic-workflow.md` | Canonical orchestrator runtime spec (v7) |
+| `docs/native-dispatch.md` | **Native delegation spec** — subagents + Workflow tool + background agents |
+| `docs/teams-delegation.md` | *Superseded* by `native-dispatch.md` (retired Teams model; kept as a stub) |
+| `docs/teams-primitives-reference.md` | *Historical* — retired `TeamCreate` / `SendMessage` / `TeamDelete` reference |
 | `docs/workflows/README.md` | Workflow library reference and chaining spec |
 | `docs/attrs-conventions.md` | `task.attrs` key conventions consumed by orchestration |
-| `scripts/build-coord-prompt.py` | Coordinator prompt assembler |
+| `scripts/build-coord-prompt.py` | Delegated-unit (coordinator) prompt assembler |
 | `scripts/orchestration_setup.sh` | Idempotent bootstrap script (entry point) |
 | `scripts/sync_persona.py` | Agent persona sync CLI |
 | `scripts/session-usage-watcher.py` | Chrome CDP session-usage monitor |
@@ -132,7 +136,7 @@ cleaned up. Always add the submodule to the target project first, then run
 
 ```bash
 # In the root of your project repo:
-git submodule add git@github.com:DevinWilsonSC/ccg_project_orchestration.git orchestration
+git submodule add https://github.com/DevinWilsonSC/ccg_project_orchestration.git orchestration
 git submodule update --init --recursive
 
 # Run the idempotent bootstrap:

@@ -114,3 +114,26 @@ def test_part0_team_lead_context():
 
 def test_part0_checkpoint_discipline_retained():
     assert "checkpoint_phase.py" in _part0()
+
+
+# --- v2 (orch-v2-rebaseline) native-dispatch assertions ---
+
+def test_part0_mentions_workflow_tool():
+    # Non-trivial units drive phases with the native Workflow tool.
+    assert "Workflow" in _part0()
+
+
+def test_part0_uses_agent_tool_for_fanout():
+    assert "Agent" in _part0()
+
+
+def test_part0_no_done_file_polling():
+    # v2 reaps off durable Taskforge state, not a .done marker.
+    assert ".done" not in _part0()
+
+
+def test_part1_uses_unit_name_label(base_task):
+    # "Team name:" was the Teams-era label; v2 uses a neutral unit name.
+    p1 = bcp.part1(base_task, worktree="/tmp/test", branch="b", window="coord-aaaaaaaa")
+    assert "Unit name:" in p1
+    assert "Team name:" not in p1
