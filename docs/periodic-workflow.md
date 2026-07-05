@@ -1,6 +1,7 @@
 # Periodic Orchestrator — Workflow Spec
 
-**Status:** v5, living document. Last revised: 2026-04-22.
+**Status:** v7 (native re-baseline, `orch-v2-rebaseline`), living document.
+Last revised: 2026-07-04.
 
 **Audience:** anyone reasoning about how `claude_orch` drives work —
 future orchestrator sessions reading their own contract, the owner when
@@ -149,8 +150,9 @@ fans out tasks manually.
 
 After: **Taskforge is the driver.** A Claude Code session running the
 `/orch-start` command wakes every 20 min, picks up tasks explicitly
-queued for `claude_orch`, delegates each to a six-phase coordinator
-child, ships completed work as a PR, and reports progress via PushNotification.
+queued for `claude_orch`, delegates each as a native delegated unit
+(a typed subagent, or a coordinator unit running the selected workflow),
+ships completed work as a PR, and reports progress via PushNotification.
 The owner queues work by setting `status=ready` +
 `assigned_to_id=claude_orch` on a task — that's it.
 
@@ -243,7 +245,7 @@ against.
 
 See `agile_tracker/docs/attrs-conventions.md` for the canonical attrs
 schema. This doc adds two orchestrator-specific keys there:
-`workflow` and `_coordinator_task_id`.
+`workflow` and `_dispatch_ref`.
 
 ---
 
@@ -524,7 +526,7 @@ Each claimed task is dispatched as a **native delegated unit** (design §2b):
 
 **Resumable tasks** re-dispatch with `build-coord-prompt.py --resume --workflow
 <attrs.checkpoint.workflow>` so the unit restarts from its last checkpoint
-phase; there is no stale window or teammate to clean up. See `orch-start.md`
+phase; there is no stale window or unit to clean up. See `orch-start.md`
 §6d for the exact commands. The unit runs in the cheapest lane that reliably
 does the job (cheap subagent for trivial/bulk, capable subagent for build +
 review — model choice never changes workflow compliance). Its prompt is
@@ -901,7 +903,7 @@ Parsed against a fixed allow-list on every tick. Everything else → menu reply.
 | `merge <short-id>` | **Manual override** — use when auto-merge was disabled (e.g., after a `hold`): `gh pr merge <url> --squash --delete-branch` on task-branch PR |
 | `hold <short-id>` | Cancel auto-merge for this PR (`gh pr merge --disable-auto <url>`); owner must send `merge <short-id>` to merge manually later |
 | `close <short-id>` | `gh pr close <url>` + note |
-| `unblock <short-id>: <text>` | Note with owner text; `blocked` → `in_progress`. Next tick treats the task as fresh (no `_coordinator_task_id`) and re-delegates via top-up |
+| `unblock <short-id>: <text>` | Note with owner text; `blocked` → `in_progress`. Next tick treats the task as fresh (no `_dispatch_ref`) and re-delegates via top-up |
 | `deploy-dev-to-main` | Open `main ← dev` PR; on subsequent `merge` reply, `gh pr merge --merge` **without** `--delete-branch` |
 | `deploy` / `deploy-prod` | Run repo's deploy script; report result |
 
@@ -1062,8 +1064,8 @@ state model (no fresh-session bootstrap). Cron variant is planned (§13).
 Taskforge leases are atomic. The second orchestrator's `claim_task`
 will fail (or no-op) because the first already holds the lease. Both
 will see the same `list_tasks` result, but only one will win the claim
-per task. `_coordinator_task_id` is session-scoped so each session
-only reaps its own background children. Non-issue in practice, but
+per task. `_dispatch_ref` names a unit this session dispatched, so each
+session only reaps its own background units. Non-issue in practice, but
 don't do it on purpose.
 
 **Q: Can the orchestrator process tasks outside `agile_tracker`?**

@@ -87,8 +87,9 @@ Contents:
 | `commands/sync-persona.md` | Claude Code slash command: pull/propose/check agent personas |
 | `docs/periodic-workflow.md` | Canonical orchestrator runtime spec (v7) |
 | `docs/native-dispatch.md` | **Native delegation spec** — subagents + Workflow tool + background agents |
+| `docs/native-primitives-reference.md` | **Native primitives reference** — `Agent`, `Workflow`, `SendMessage`, `ScheduleWakeup`, `PushNotification`, background agents |
 | `docs/teams-delegation.md` | *Superseded* by `native-dispatch.md` (retired Teams model; kept as a stub) |
-| `docs/teams-primitives-reference.md` | *Historical* — retired `TeamCreate` / `SendMessage` / `TeamDelete` reference |
+| `docs/teams-primitives-reference.md` | *Retired* — redirect stub → `native-primitives-reference.md` |
 | `docs/workflows/README.md` | Workflow library reference and chaining spec |
 | `docs/attrs-conventions.md` | `task.attrs` key conventions consumed by orchestration |
 | `scripts/build-coord-prompt.py` | Delegated-unit (coordinator) prompt assembler |

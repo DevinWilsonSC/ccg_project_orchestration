@@ -1,8 +1,19 @@
 # WFE-CKPT-2: Checkpoint Helper + `--resume` Mode Design
 
-**Status:** Design  
-**Author:** software-architect  
+**Status:** Design (partially superseded by `orch-v2-rebaseline`)
+**Author:** software-architect
 **Date:** 2026-04-22
+
+> **Historical note.** The checkpoint helper (`checkpoint_phase.py`) and
+> `build-coord-prompt.py --resume` this doc specifies are **still current**. But
+> this design predates the native re-baseline: any `tmux` window / pane /
+> `claude -p` mechanics it describes (e.g. deriving `by_coord` from a tmux
+> window name, "tmux `-t` targeting" rules) are the **retired** execution
+> substrate. In v2, delegated units are native subagents (the `Agent` tool) and
+> `by_coord` is just the `coord-<short>` audit label — there is no tmux window.
+> For current delegation/dispatch behaviour see
+> [`native-dispatch.md`](../native-dispatch.md) and
+> [`native-primitives-reference.md`](../native-primitives-reference.md).
 
 ---
 

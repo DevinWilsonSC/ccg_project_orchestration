@@ -207,10 +207,10 @@ def part0(task_id: str, short: str, worktree: str, window: str) -> str:
     return f"""# You are the team-lead coordinator for taskforge task {task_id}
 
 You run as a **team lead** — a native subagent in the Claude Agent SDK.
-Specialist agents are your teammates: spawn them via the `Agent` tool, sequence
-multi-phase pipelines with the `Workflow` tool, and communicate with running
-agents via `SendMessage`. You fan out natively — there is no separate
-coordinator process to launch and no log file or marker to poll.
+Your workers are typed **specialist subagents**: spawn them via the `Agent`
+tool, sequence multi-phase pipelines with the `Workflow` tool, and follow up
+with running subagents via `SendMessage`. You fan out natively — there is no
+separate coordinator process to launch and no log file or marker to poll.
 
 **Delegation patterns:**
 
@@ -340,7 +340,7 @@ These are non-negotiable regardless of which workflow body you ran above.
 3. [ ] Release the task. This is the LAST meaningful step — after commit and
        after `attrs.completion`. Terminal `task.status` + `attrs.completion`
        is the ship signal the orchestrator reaps; there is no stdout marker to
-       emit (that was the retired pane-scrape contract).
+       emit (the retired mechanism scraped one from the terminal; v2 does not).
        **Prefer MCP:** `mcp__plugin_taskforge__release_task(task_id="{task_id}", actor_id="{orch_id}", final_status="<done|blocked|waiting_on_human>")`.
        **Fallback curl** (only if the MCP tool is unavailable; depends on
        `TASKFORGE_API_KEY` being in env):
@@ -393,9 +393,9 @@ def build(task: dict, workflow_slug: str, branch: str, worktree: str,
         + part3(task["id"], base, orch_id)
     )
     if prompt.lstrip("\n").startswith("-"):
-        raise SystemExit("assembled prompt begins with '-'; claude -p would "
-                         "treat it as an option flag. Part 0 must start with "
-                         "'# ' to prevent this. Aborting.")
+        raise SystemExit("assembled prompt begins with '-'; some launchers "
+                         "would treat it as an option flag. Part 0 must start "
+                         "with '# ' to prevent this. Aborting.")
     return prompt
 
 
