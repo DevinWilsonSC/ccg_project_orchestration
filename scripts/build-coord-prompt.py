@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Build a coordinator prompt for a team-lead coordinator agent.
+"""Build the delegated-unit prompt for a native team-lead coordinator.
 
-Canonical assembly of the four-part coordinator prompt specified in
-`.claude/commands/orch-start.md` §6d:
+Canonical assembly of the four-part unit prompt specified in
+`.claude/commands/orch-start.md` §6d. In orchestration v2 the delegated unit
+is a **native subagent** (the `Agent` tool) that runs the workflow's phases via
+the **Workflow tool** and fans out to typed specialist subagents — there is no
+tmux window and no `claude -p` child. The four parts:
 
-  Part 0  team-lead context: teammate assignment via the Agent tool,
-          SendMessage patterns, checkpoint discipline. ALWAYS prepended.
+  Part 0  team-lead delegation context: specialist fan-out via the Agent tool,
+          multi-phase pipelines via the Workflow tool, SendMessage follow-ups
+          to running agents, and checkpoint discipline. ALWAYS prepended.
           Starts with "# " so the assembled prompt never begins with a
           dash (some launchers would parse a leading `-` as an option flag).
-  Part 1  task-fields block: title, description, AC, plan, Teams teammate.
+  Part 1  task-fields block: title, description, AC, plan, unit name.
   Part 2  workflow body, from .orchestration/workflows/<slug>.md (materialized
           cache), falling back to the taskforge REST API on miss, then
           to docs/workflows/<slug>.md (legacy, deprecated).
@@ -202,24 +206,32 @@ def render_workflow(body: str, ctx: dict[str, str]) -> str:
 def part0(task_id: str, short: str, worktree: str, window: str) -> str:
     return f"""# You are the team-lead coordinator for taskforge task {task_id}
 
-You run as a **team lead** in the Claude Agent SDK. Specialist agents are your
-teammates — spawn them via the `Agent` tool and communicate with running ones
-via `SendMessage`.
+You run as a **team lead** — a native subagent in the Claude Agent SDK.
+Your workers are typed **specialist subagents**: spawn them via the `Agent`
+tool, sequence multi-phase pipelines with the `Workflow` tool, and follow up
+with running subagents via `SendMessage`. You fan out natively — there is no
+separate coordinator process to launch and no log file or marker to poll.
 
-**Teammate assignment and communication patterns:**
+**Delegation patterns:**
 
 1. **Spawn a specialist** by calling the `Agent` tool with `subagent_type` set
-   to the role name and a self-contained prompt that includes the task context,
-   working directory, branch, and acceptance criteria.
+   to the role name (e.g. `python-expert`, `software-architect`, `frontend-ux`,
+   `frontend-ui`, `aws-security`) and a self-contained prompt that includes the
+   task context, working directory, branch, and acceptance criteria.
 
-2. **Parallel work** (e.g. BUILD phase): issue multiple `Agent` tool calls in a
+2. **Multi-phase workflows**: drive the phases below with the `Workflow` tool
+   (`phase()` / `pipeline()` / `parallel()`) so each stage is deterministic
+   control flow. Hand structured results back via the Workflow `schema` option
+   rather than free-form stdout.
+
+3. **Parallel work** (e.g. BUILD phase): issue multiple `Agent` tool calls in a
    single response — the runtime executes them concurrently. Collect all results
    before proceeding to the next phase.
 
-3. **Sequential handoffs**: spawn each specialist only after the previous one
+4. **Sequential handoffs**: spawn each specialist only after the previous one
    returns. Pass its result as context to the next specialist's prompt.
 
-4. **Follow-up messages** to a named running agent:
+5. **Follow-up messages** to a named running agent:
    `SendMessage(to="<name>", message="<instructions>")`
 
 CRITICAL — Checkpoint discipline:
@@ -241,7 +253,7 @@ def part1(task: dict, worktree: str, branch: str, window: str) -> str:
         f"You are the coordinator for taskforge task {task['id']}.",
         f"Working directory: {worktree}",
         f"Branch: {branch}",
-        f"Team name: {window}",
+        f"Unit name: {window}",
         "",
         f"Title: {task['title']}",
         "",
@@ -325,8 +337,11 @@ These are non-negotiable regardless of which workflow body you ran above.
        attribution in author, committer, or Co-Authored-By trailers.
 2. [ ] `task.attrs.completion` is set via MCP/REST PATCH to a short
        human-readable summary of what shipped (files, tests, deferred).
-3. [ ] Release AND emit the RELEASED marker.
-       **Prefer MCP:** `mcp__plugin_taskforge__release_task(task_id="{task_id}", actor_id="{orch_id}", final_status="<done|blocked|waiting_on_human>")` then `echo "RELEASED <status>"`.
+3. [ ] Release the task. This is the LAST meaningful step — after commit and
+       after `attrs.completion`. Terminal `task.status` + `attrs.completion`
+       is the ship signal the orchestrator reaps; there is no stdout marker to
+       emit (the retired mechanism scraped one from the terminal; v2 does not).
+       **Prefer MCP:** `mcp__plugin_taskforge__release_task(task_id="{task_id}", actor_id="{orch_id}", final_status="<done|blocked|waiting_on_human>")`.
        **Fallback curl** (only if the MCP tool is unavailable; depends on
        `TASKFORGE_API_KEY` being in env):
        ```bash
@@ -335,11 +350,10 @@ These are non-negotiable regardless of which workflow body you ran above.
          -H "X-API-Key: $TASKFORGE_API_KEY" \\
          -H "Content-Type: application/json" \\
          -d "{{\\"actor_id\\":\\"{orch_id}\\",\\"final_status\\":\\"$STATUS\\"}}" \\
-         "{base}/tasks/{task_id}/release" \\
-         && echo "RELEASED $STATUS"
+         "{base}/tasks/{task_id}/release"
        ```
        If curl returns 401 (missing key), the orchestrator will
-       salvage-release on your behalf — exit 0 with your narrative rather
+       salvage-release on your behalf — return with your narrative rather
        than faking `blocked`.
 
 Do NOT push the branch. Do NOT open a PR. Do NOT run any `gh` command.
@@ -379,9 +393,9 @@ def build(task: dict, workflow_slug: str, branch: str, worktree: str,
         + part3(task["id"], base, orch_id)
     )
     if prompt.lstrip("\n").startswith("-"):
-        raise SystemExit("assembled prompt begins with '-'; claude -p would "
-                         "treat it as an option flag. Part 0 must start with "
-                         "'# ' to prevent this. Aborting.")
+        raise SystemExit("assembled prompt begins with '-'; some launchers "
+                         "would treat it as an option flag. Part 0 must start "
+                         "with '# ' to prevent this. Aborting.")
     return prompt
 
 

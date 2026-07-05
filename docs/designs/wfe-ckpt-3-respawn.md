@@ -1,9 +1,21 @@
 # WFE-CKPT-3: SIGTERM-on-Pause + Checkpoint-Aware Respawn
 
-**Status:** Design  
-**Author:** software-architect  
-**Date:** 2026-04-22  
+**Status:** Design — **RETIRED by `orch-v2-rebaseline`** (kept as provenance)
+**Author:** software-architect
+**Date:** 2026-04-22
 **Task:** fb683703-974d-4451-84dd-47059a26c893
+
+> **RETIRED.** This document describes the v6 **SIGTERM-on-pause** mechanism for
+> tmux-window / `claude -p` coordinators that shared the orchestrator's quota.
+> v2 **does not SIGTERM or tear down** in-flight units on a quota pause — native
+> background agents are harness-managed and independent of the orchestrator's
+> turn (they continue, or re-enter as Fresh/Resumable if they die). Every
+> `tmux`, pane, `claude -p`, and `_coordinator_tmux_window` reference below is
+> the **retired** execution substrate and is not current behaviour. The one idea
+> that survives is **checkpoint-aware respawn** (the Resumable bucket), now done
+> natively via `build-coord-prompt.py --resume` with no tmux window to reuse.
+> For current behaviour see [`native-dispatch.md`](../native-dispatch.md) §4
+> (Quota pause) and [`periodic-workflow.md`](../periodic-workflow.md) §0a.
 
 ---
 

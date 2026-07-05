@@ -13,7 +13,8 @@ Exit codes:
 Environment:
   TASKFORGE_API_KEY      required
   TASKFORGE_BASE_URL     default: http://taskforge-prod:8000
-  COORD_TEAM_NAME        Teams teammate name stored in checkpoint.by_coord
+  COORD_TEAM_NAME        Delegated-unit name (e.g. coord-<short>) stored in
+                         checkpoint.by_coord
 """
 from __future__ import annotations
 
@@ -26,8 +27,9 @@ import httpx
 
 def _get_by_coord() -> str:
     # Prefer the new env var, fall back to the legacy COORD_WINDOW for
-    # any wrapper that hasn't been updated yet. tmux-based detection
-    # is gone — coordinators now run as Teams teammates with no tmux.
+    # any wrapper that hasn't been updated yet. Delegated units are native
+    # subagents (Agent tool) — there is no tmux window and no Teams teammate;
+    # by_coord is just the coord-<short> label for audit/checkpoint provenance.
     return (
         os.environ.get("COORD_TEAM_NAME")
         or os.environ.get("COORD_WINDOW")

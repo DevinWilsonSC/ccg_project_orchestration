@@ -14,7 +14,7 @@ Contract for the output file (consumed by scripts/session-usage-check.sh):
     "reset_str":     <raw "1 hr 31 min" string, for debugging>
   }
 
-Run in tmux or systemd. Logs to stderr.
+Run under systemd (or any long-lived process supervisor). Logs to stderr.
 """
 
 import argparse

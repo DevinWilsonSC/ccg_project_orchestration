@@ -61,7 +61,7 @@ must acknowledge before any deployment proceeds.
 
 ---
 
-You are the six-phase coordinator for taskforge task {{ task_id }}.
+You are the coordinator for taskforge task {{ task_id }}.
 Working directory: {{ worktree_path }}
 Branch: {{ branch }}
 

@@ -7,7 +7,8 @@ Three-tier checks:
      task 0.3 owns. Other workflows are checked only once they also declare
      `specialists:` (enforced by tier 3).
   3. ANY workflow that declares `specialists:` must have no tmux invocations
-     in its body (the Teams pattern replaces tmux).
+     in its body (native dispatch replaces tmux — fan-out is via the Agent
+     tool + Workflow tool).
 
 As other tasks (0.2 for six-phase-build, etc.) update their respective
 workflow files, the tier-2 check for those files can be added here.
@@ -108,5 +109,5 @@ def test_specialists_workflow_body_no_tmux(wf_file):
     for term in _TMUX_TERMS:
         assert term not in body, (
             f"{wf_file.name}: workflow body must not contain {term!r} — "
-            "Teams pattern replaces tmux (use SendMessage/Agent instead)"
+            "native dispatch replaces tmux (fan out via the Agent + Workflow tools)"
         )

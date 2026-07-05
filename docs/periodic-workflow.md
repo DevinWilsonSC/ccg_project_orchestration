@@ -1,16 +1,20 @@
 # Periodic Orchestrator — Workflow Spec
 
-**Status:** v5, living document. Last revised: 2026-04-22.
+**Status:** v7 (native re-baseline, `orch-v2-rebaseline`), living document.
+Last revised: 2026-07-04.
 
 **Audience:** anyone reasoning about how `claude_orch` drives work —
 future orchestrator sessions reading their own contract, the owner when
 queuing tasks for the orchestrator, agents being asked to extend this
 workflow.
 
-**Canonical runnable form:** `agile_tracker/.claude/commands/orch-start.md`.
+**Canonical runnable form:** `orchestration/commands/orch-start.md`.
 That command is the executable summary; this doc is the why, the
 why-not, and the edges. If the two disagree, update both in the same
-change — do not let them drift.
+change — do not let them drift. As of v7 the runnable form dispatches via
+native subagents + the Workflow tool + background agents; the version-changelog
+entries below (v2–v6) are retained as **provenance** and describe the retired
+tmux / `claude -p` / Teams mechanism, not current behaviour.
 
 **v2 changes (vs v1):**
 - Each tick now has three phases: **reap / heartbeat / top-up**.
@@ -93,6 +97,43 @@ change — do not let them drift.
   crash-without-checkpoint (§3b last-resort salvage).** The salvage path is
   retained as a fallback for pre-checkpoint failures only.
 
+**v7 changes (vs v6) — native re-baseline (`orch-v2-rebaseline`):**
+- **Retires the tmux + `claude -p` + Teams coordinator scaffolding.** No
+  `tmux new-window`, no panes, no `claude -p` coordinator children, no
+  `TeamCreate`/`SendMessage` to *launch* a coordinator, no pane-scraping, no
+  `/tmp/coord-*.done` files, and no `RELEASED <status>` stdout marker.
+- **Dispatch is native.** Each claimed task is worked by a native delegated
+  unit: a **typed subagent** (`Agent` tool, `subagent_type=<persona-slug>`) for
+  trivial tasks; a **Workflow** (the `Workflow` tool — `phase()` / `pipeline()`
+  / `parallel()`) that fans out to typed specialist subagents for non-trivial
+  tasks; run as a **background agent** so the loop stays responsive. The
+  Workflow **is** the coordinator. Structured hand-back uses the Workflow
+  `schema` option (validated tool output), not stdout parsing.
+- **Reap keys off durable state.** Completion = terminal `task.status` +
+  `attrs.completion`, plus native completion notifications for an out-of-band
+  early reap. No marker files.
+- **Internal marker renamed.** `attrs._coordinator_team_name` →
+  `attrs._dispatch_ref` (`{kind, id, started_at}`). Legacy markers
+  (`_coordinator_team_name`, `_coordinator_tmux_window`, `_coordinator_task_id`)
+  are **tolerated** (ignored, cleared on reclaim) and never written.
+- **Adaptive phases.** The six phases remain the reference pipeline for a full
+  feature build but are **selected per task** (`attrs.workflow` / best-fit /
+  `chains_with`), not imposed on every task. Security stays a *trigger*, not a
+  phase.
+- **Effort-tiered lanes.** Each unit runs in the cheapest lane that reliably
+  does the job (cheap subagent for trivial/bulk; capable subagent for build +
+  review; orchestration stays top-tier and is never delegated down).
+- **Concurrency default is `ORCH_MAX_IN_FLIGHT` = 10** — a single env-var source
+  of truth. (The old orch readme's `3` was tmux-era conservatism and is
+  corrected; native background subagents are far lighter.)
+- **Everything else in §3 is invariant:** leases/heartbeat/`sweep_expired_leases`,
+  `AuditEvent` on every mutation, the DB `WorkflowVersion` gate, the AI-field
+  gate (`repo_path` + `acceptance_criteria`, 422), DAG cycle detection,
+  `client_request_id` idempotency, Telegram/PushNotification HITL, and
+  prompt-injection hygiene are unchanged. v2 is an execution-layer change only.
+- See `docs/designs/orch-v2-rebaseline.md` (taskforge repo) for the full design
+  and `docs/native-dispatch.md` for the delegation spec.
+
 **Related:**
 - `ccg/orchestration.md` — top-level orchestrator runtime rules.
 - `agile_tracker/CLAUDE.md` — six-phase workflow + agent team.
@@ -109,8 +150,9 @@ fans out tasks manually.
 
 After: **Taskforge is the driver.** A Claude Code session running the
 `/orch-start` command wakes every 20 min, picks up tasks explicitly
-queued for `claude_orch`, delegates each to a six-phase coordinator
-child, ships completed work as a PR, and reports progress via PushNotification.
+queued for `claude_orch`, delegates each as a native delegated unit
+(a typed subagent, or a coordinator unit running the selected workflow),
+ships completed work as a PR, and reports progress via PushNotification.
 The owner queues work by setting `status=ready` +
 `assigned_to_id=claude_orch` on a task — that's it.
 
@@ -131,10 +173,10 @@ claiming a `ready` task via `claim_task` (or the TOP-UP step) automatically
 transitions it to `in_progress`. This means `in_progress` always means
 "actively being worked on" — never "please pick this up".
 
-**Resumable tasks (`in_progress` + checkpoint + no window).** An
+**Resumable tasks (`in_progress` + checkpoint + no live unit).** An
 `in_progress` task with `attrs.checkpoint.phases_completed` non-empty and
-no live `_coordinator_team_name` is classified Resumable in §4a and
-picked up for respawn during TOP UP (§4c), not released. This applies only
+no live `_dispatch_ref` is classified Resumable in §4a and
+picked up for re-dispatch during TOP UP (§4c), not released. This applies only
 to tasks the orchestrator itself claimed — it never touches `in_progress`
 tasks assigned to other actors. The "predictability outranks throughput"
 rule is preserved: the orchestrator only acts on what it owns.
@@ -173,7 +215,7 @@ some are in `attrs`.
 | `attrs.completion` | attr | written by coordinator | — | Short summary of what shipped |
 | `attrs.review_findings` | attr | written by coordinator (only when findings persist after the in-tick fix-up round) | — | Surfaced in the PR body so the owner can judge in review |
 | `attrs.pr_url` | attr | written by orchestrator | — | PR link for owner review |
-| `attrs._coordinator_team_name` | attr | **orchestrator-internal** — written when launching the coordinator team; cleared on reap | — | The Teams teammate name (e.g. `coord-b77cc8a9`) for the coordinator `claude -p` process working this task. Presence of a stale window name on a fresh task signals an orphan — reclaim and clear. Underscore-prefixed per attrs-conventions. |
+| `attrs._dispatch_ref` | attr | **orchestrator-internal** — written when dispatching the delegated unit; cleared on reap | — | The native delegated unit for this task: `{kind: subagent\|workflow\|background, id, started_at}`. Its presence marks the task In-flight. A stale ref (unit not visible this session) signals an orphan — reclaim and clear. Legacy `_coordinator_team_name` / `_coordinator_tmux_window` / `_coordinator_task_id` are tolerated on read and cleared on reclaim; v2 never writes them. Underscore-prefixed per attrs-conventions. |
 | `attrs.workflow_version_id` | attr | **orchestrator-internal** — written at intake when a workflow version is selected | — | UUID FK to `workflow_versions.id`. Persists across coordinator restarts; used by the orchestrator to verify checkpoint freshness (still the published version?) without parsing the nested `checkpoint` object. |
 
 **`repo_path` inheritance.** The orchestrator calls the
@@ -203,7 +245,7 @@ against.
 
 See `agile_tracker/docs/attrs-conventions.md` for the canonical attrs
 schema. This doc adds two orchestrator-specific keys there:
-`workflow` and `_coordinator_task_id`.
+`workflow` and `_dispatch_ref`.
 
 ---
 
@@ -255,26 +297,20 @@ that occurs when `RESET_EPOCH` is more than 3600s away.
      threshold is tighter than the 600s gate in `session-usage-check.sh`
      because here we need an accurate `RESET_EPOCH` for the delay
      computation, not just a liveness check.
-  3. **SIGTERM all in-flight coordinator processes.** Coordinators share
-     the orchestrator's Anthropic quota and will be killed at 100% anyway
-     — a controlled SIGTERM preserves partial work for resume. For each
-     in-flight coord: enumerate teammate handles via `TeamGet` (the team holds the lease — keeping it alive across the pause is sufficient).
-     '#{pane_pid}'`, SIGTERM + 10 s grace + SIGKILL survivors. Worktrees
-     are preserved in all cases. The Teams teammate is conditionally
-     preserved: if the coord has a checkpoint (`phases_completed` non-empty),
-     preserve the window (for `respawn-window -k` on resume) and write
-     `.done` + exit `99`; otherwise kill the window with `TeamDelete`
-     and skip `.done`/`.exit` so Fresh top-up can use `TeamCreate`
-     cleanly on the next tick. See `orch-start.md §0a` for the exact bash.
-  4. Clear `attrs._coordinator_team_name` for each SIGTERM'd task
-     (one PATCH per task, AFTER processes are dead). This makes the next
-     tick classify the task as Resumable (checkpoint present) or Fresh
-     (no checkpoint) rather than In-flight.
-  5. Write `RESET_EPOCH` to `/tmp/orch-quota-paused-until`.
-  6. Compute `DELAY = min(3600, max(60, RESET_EPOCH + 60 - now))`.
-  7. Notify: `"⏸ Session quota at N% — pausing. SIGTERMed K
-     coordinators; will respawn on resume (~ETA)."` (sent once only).
-  8. `ScheduleWakeup(DELAY)`. End tick.
+  3. **Do NOT tear down in-flight units.** v2 does not SIGTERM, kill, or
+     `TeamDelete` delegated units on a quota pause — that was the tmux/`claude
+     -p` era, where coordinators were heavyweight processes sharing the
+     orchestrator's quota. Native background agents are harness-managed and
+     independent of the orchestrator's turn: they keep running (subject to their
+     own quota) and are reaped on a later full tick. A unit that does die
+     mid-pause loses its lease and re-enters as Fresh, or Resumable if it has a
+     checkpoint — the standard recovery path. Worktrees are preserved in all
+     cases. `attrs._dispatch_ref` is left intact.
+  4. Write `RESET_EPOCH` to `/tmp/orch-quota-paused-until`.
+  5. Compute `DELAY = min(3600, max(60, RESET_EPOCH + 60 - now))`.
+  6. Notify **once**: `"⏸ Session quota at N% — pausing until ~ETA.
+     In-flight units continue; leases heartbeated on each hop."`
+  7. `ScheduleWakeup(DELAY)`. End tick.
 
 **Why not CronCreate?** `CronCreate` starts a brand-new session
 (`<<autonomous-loop>>`), not the current one. It cannot resume the
@@ -307,61 +343,57 @@ REAP classification is a union of three `list_tasks` queries (all
 filtered by `assigned_to=claude_orch`): `status=ready`,
 `status=in_progress`, and `status in (done, blocked,
 waiting_on_human)`. Results are filtered client-side on
-`attrs._coordinator_team_name` being set — the third bucket in
-particular would otherwise miss coordinators that called `release_task`
+`attrs._dispatch_ref` being set — the third bucket in
+particular would otherwise miss units that called `release_task`
 (which transitions the task out of `in_progress`) before the
 orchestrator reaps, stranding the branch work.
 
-**Ship signal is Taskforge status + `attrs.completion`, not the `.done`
-FS marker.** A coordinator that calls `release_task` may still be alive
-for 10–60 s emitting final narrative; per Part 3 of the coord prompt,
-`release_task` is the LAST meaningful step (after commit, after
-`attrs.completion`), so once status is terminal the branch is frozen
-and shippable. Route on this signal:
+**Ship signal is Taskforge status + `attrs.completion`** — durable state, not
+a `.done` file or stdout marker (those were the retired pane-scraping signals).
+Per Part 3 of the unit prompt, `release_task` is the LAST meaningful step
+(after commit, after `attrs.completion`), so once status is terminal the branch
+is frozen and shippable. A native background-agent completion notification may
+fire an out-of-band reap for that one task; otherwise the tick-interval poll
+detects it. Route on this signal:
 
-- **Released** — `_coordinator_team_name` set AND `task.status ∈
+- **Released** — `_dispatch_ref` set AND `task.status ∈
   {done, blocked, waiting_on_human}` AND `attrs.completion` present.
-  Read the final non-empty line from `/tmp/coord-<short-id>.log` for
-  the `RELEASED <status>` marker; it's diagnostic only (used for
-  prompt-tuning notes) — do NOT block on it.
   - `done` → **full ship path** (§7), auto-merge.
   - `blocked` / `waiting_on_human` → **partial-ship path** (§7 steps
     1–5), push branch + open PR, no auto-merge; PushNotification the blocker
     with PR URL.
-  After routing, clear `_coordinator_team_name` to free the slot.
+  After routing, clear `_dispatch_ref` to free the slot.
 
-- **Crashed** — `_coordinator_team_name` set AND
-  `/tmp/coord-<short-id>.done` exists AND `task.status == in_progress`.
-  Apply the checkpoint guard (see `orch-start.md` §3b): if
-  `attrs.checkpoint.phases_completed` is non-empty, take the resume path
-  (no release, clear window attr, partial cleanup, queue for next-tick
-  respawn); otherwise fall through to last-resort salvage (`release_task
-  blocked`, partial-ship, PushNotification, self-improvement task).
+- **Crashed / died** — a unit that returned null (skipped / died) and left the
+  task stuck `in_progress`. If `attrs.checkpoint.phases_completed` is non-empty,
+  take the resume path (no release, clear `_dispatch_ref`, queue for next-tick
+  re-dispatch); otherwise `release_task blocked` with an `add_note`
+  (last-resort salvage: partial-ship, PushNotification, self-improvement task).
+  There is no `.done` file to key off — a stuck-`in_progress` task whose unit is
+  gone this session, or a lease that `sweep_expired_leases` has reverted, is the
+  crash signal.
 
-- **In-flight** — `_coordinator_team_name` set, neither of the above.
-  Coordinator is still working. Heartbeat in §4b.
+- **In-flight** — `_dispatch_ref` set, neither of the above. Unit still working.
+  Heartbeat in §4b.
 
-- **Fresh** — `_coordinator_team_name` unset (or both the `.done`
-  file and Teams teammate are gone) AND (`attrs.checkpoint` absent OR
-  `attrs.checkpoint.phases_completed` empty). Joins top-up candidates
-  in §4c. **Legacy**: tasks with the old `attrs._coordinator_task_id`
-  (Agent-tool era, v3) are treated as fresh — clear the stale attr on
-  reclaim.
+- **Fresh** — `_dispatch_ref` unset AND (`attrs.checkpoint` absent OR
+  `attrs.checkpoint.phases_completed` empty). Joins top-up candidates in §4c.
+  **Legacy**: tasks carrying a retired `attrs._coordinator_team_name` /
+  `_coordinator_tmux_window` / `_coordinator_task_id` are treated as fresh —
+  ignore the key, clear the stale attr on reclaim.
 
-- **Resumable** — `_coordinator_team_name` unset (or named window gone),
-  `attrs.checkpoint.phases_completed` non-empty, `task.status ∈
-  {ready, in_progress}`. Joins top-up candidates in §4c with priority
-  over Fresh tasks. Respawned via `build-coord-prompt.py --resume
-  --workflow <checkpoint.workflow>` (see `orch-start.md` §6d). Before
-  invoking `--resume`, a workflow version guard checks
-  `attrs.checkpoint.workflow_version` vs `attrs.workflow_version_id`;
-  on mismatch the task is blocked with a partial-ship PR instead of
-  entering an infinite respawn loop (see `orch-start.md` §6d, M2).
+- **Resumable** — `_dispatch_ref` unset, `attrs.checkpoint.phases_completed`
+  non-empty, `task.status ∈ {ready, in_progress}`. Joins top-up candidates in
+  §4c with priority over Fresh tasks. Re-dispatched via
+  `build-coord-prompt.py --resume --workflow <checkpoint.workflow>` (see
+  `orch-start.md` §6d). Before invoking `--resume`, a workflow-version guard
+  checks `attrs.checkpoint.workflow_version` vs `attrs.workflow_version_id`; on
+  mismatch the task is blocked with a partial-ship PR instead of looping (see
+  `orch-start.md` §6d, M2).
 
-Post-reap cleanup: after all released/crashed tasks are handled, sweep
-`/tmp/coord-*.done` files whose corresponding tasks no longer have
-`_coordinator_team_name` set and remove tempfiles + `TeamDelete` the
-window. See `orch-start.md` §3c for the exact steps.
+Post-reap cleanup: clear `_dispatch_ref` on every released task. There are no
+`/tmp/coord-*.done` files, logs, tmux windows, or Teams teammates to sweep —
+native units leave none.
 
 ### 4b. HEARTBEAT
 
@@ -446,77 +478,82 @@ walk is therefore guaranteed to terminate.
    `docs/orchestrator/workflows/`). Author a draft on structural miss (see
    `orch-start.md` §6b-workflow). Write the selected
    `workflow_versions.id` into `attrs.workflow_version_id`.
-6. Launch the **coordinator child** via `TeamCreate -n
-   "coord-<short-id>"` + `claude -p` with the coordinator prompt
-   assembled from the task-fields block + verbatim body of the selected
-   workflow version (`orch-start.md` §6d). See
-   `docs/teams-delegation.md` for the exact launch contract.
-7. Write the team name (`coord-<short-id>`) into
-   `attrs._coordinator_team_name`.
+6. **Dispatch the delegated unit.** Trivial tasks → a single typed subagent
+   (`Agent`, low-effort lane). Non-trivial → a coordinator unit that runs the
+   selected workflow via the Workflow tool and fans out to typed specialist
+   subagents. Both run as **background agents** (`run_in_background: true`) so
+   the loop stays responsive. The unit prompt is assembled by
+   `build-coord-prompt.py` from the task-fields block + verbatim workflow-version
+   body (`orch-start.md` §6d). See `docs/native-dispatch.md` for the exact
+   dispatch contract.
+7. Write the dispatch reference into `attrs._dispatch_ref`
+   (`{kind, id, started_at}`).
 
-The orchestrator does **not** wait for the coordinator. It goes back
-to sleep via `ScheduleWakeup`; the next tick reaps.
+The orchestrator does **not** wait for the unit. It goes back to sleep via
+`ScheduleWakeup`; the next tick reaps.
 
 ### Orphan handling
 
-If `_coordinator_team_name` points to a Teams teammate that no longer
-exists (e.g., orchestrator process died or machine restarted), treat the
-task as **fresh** — the orphaned `claude -p` process died with its
-orchestrator session. Taskforge's lease will expire within 30 min and
-`sweep_expired_leases` will revert it to TODO if not reclaimed. On
-reclaim during top-up, clear the stale window name.
+If `_dispatch_ref` names a unit not visible in this session (e.g., orchestrator
+process died or machine restarted), treat the task as **fresh** — the orphaned
+background agent died with its orchestrator session. Taskforge's lease will
+expire within 30 min and `sweep_expired_leases` will revert it to TODO if not
+reclaimed. On reclaim during top-up, clear the stale ref. Retired markers
+(`_coordinator_team_name` / `_coordinator_tmux_window` / `_coordinator_task_id`)
+are treated identically — ignored and cleared.
 
-Note: coordinators can survive orchestrator session context resets
-because they run as independent processes in Teams teammates. If the
-orchestrator ends but the Claude Code session stays alive, coordinator teams
-continue to completion and their `.done` files will be waiting for
-the next orchestrator session to reap.
+Note: a **background agent** can survive an orchestrator session context reset
+because it is independent of the orchestrator's turn. If the orchestrator ends
+but the Claude Code session stays alive, in-flight background units continue to
+completion and their terminal `task.status` waits for the next orchestrator
+session to reap.
 
 ---
 
-## 5. Coordinator invocation
+## 5. Delegated-unit invocation (native subagents + Workflow tool)
 
-Each claimed task spawns one coordinator child in a Teams teammate via
-`claude -p`. **Resumable tasks** reuse the existing `coord-<short>`
-team slot via `TeamCreate` re-bind (dead teammates from the previous
-run are replaced) and pass `--resume --workflow <attrs.checkpoint.workflow>`
-to `build-coord-prompt.py` so the coordinator restarts from its last
-checkpoint phase. Fresh tasks use `TeamCreate` as before. See
-`orch-start.md` §6d for the exact commands. The coordinator is a full
-Claude session (model opus for non-trivial tasks, sonnet for lightweight)
-whose prompt is
-composed of four parts:
+Each claimed task is dispatched as a **native delegated unit** (design §2b):
 
-- **Part 0 — single-turn session guidance.** Always first. States
-  that `claude -p` is single-turn (no `ScheduleWakeup`, no resume,
-  no wake-up), mandates the shell-poll pattern for "wait for
-  `.done`" synchronization, and requires every `SendMessage` to
-  pass `-t "coord-<short-id>"` so specialists land in the coord's
-  own window rather than the orchestrator's active pane. Without
-  this preamble, opus coordinators have been observed to
-  hallucinate `ScheduleWakeup` / "sleeping until next check" and
-  exit mid-workflow. **Prompt-construction gotcha:** the assembled
-  prompt must NOT start with `-`/`--`/`---` — `claude -p` parses a
-  leading dash as an option flag and the launch fails with
-  `error: unknown option`. Part 0 begins with `# CRITICAL:` to
-  sidestep this; do not restructure without preserving that
-  property.
-- **Part 1 — task-fields block.** Title, description, acceptance
-  criteria, plan, plus the coord's own Teams teammate name
-  (`coord-<short-id>`) so Part 0's `-t` rule has a concrete target.
-- **Part 2 — workflow body.** The verbatim body of the selected
-  workflow file from the workflow library
-  (`docs/orchestrator/workflows/`), with `{{ }}` tokens substituted.
-  The workflow body is the complete phase list — the orchestrator does
-  not inline phase instructions.
-- **Part 3 — mandatory release checklist trailer.** Orchestrator-
-  injected, identical across all workflows: commit-attribution
-  discipline, `attrs.completion` PATCH, and — as a single scripted bash
-  step — the release POST plus the `RELEASED <status>` final-line
-  contract parsed by REAP (§4a). The release and the marker echo are
-  chained with `&&` so the `echo "RELEASED $STATUS"` only runs after
-  `curl -f` returns 2xx; there is no way to emit the marker without
-  actually releasing. Specified exactly once in `orch-start.md` §6d
+- **Trivial tasks** → a single **typed subagent** (`Agent` tool,
+  `subagent_type=<persona-slug>`) at a low-effort lane. No phase pipeline.
+- **Non-trivial tasks** → a **coordinator unit** that drives the selected
+  workflow's phases with the **Workflow tool** (`phase()` / `pipeline()` /
+  `parallel()`) and fans out to typed specialist subagents. The Workflow **is**
+  the coordinator — there is no `claude -p` child and no tmux window.
+- Both are run as **background agents** by default so the orchestrator loop
+  stays responsive; the unit is reaped on a later tick via terminal
+  `task.status` + native completion notification.
+
+**Resumable tasks** re-dispatch with `build-coord-prompt.py --resume --workflow
+<attrs.checkpoint.workflow>` so the unit restarts from its last checkpoint
+phase; there is no stale window or unit to clean up. See `orch-start.md`
+§6d for the exact commands. The unit runs in the cheapest lane that reliably
+does the job (cheap subagent for trivial/bulk, capable subagent for build +
+review — model choice never changes workflow compliance). Its prompt is
+assembled by `build-coord-prompt.py` in four parts:
+
+- **Part 0 — delegation guidance.** Always first. Frames the unit as a
+  team-lead coordinator that fans out to specialist subagents via the `Agent`
+  tool (parallel phases = multiple `Agent` calls in one response; sequential
+  handoffs = spawn-then-await), sequences multi-phase pipelines with the
+  `Workflow` tool, and follows up with running agents via `SendMessage`. It
+  runs the checkpoint helper at the start of every phase for safe resume. It
+  does **not** reference `ScheduleWakeup`, tmux, `claude -p`, or `.done`-file
+  polling — those were the retired mechanisms. **Prompt-construction guard:**
+  the assembled prompt must NOT start with `-`/`--`/`---` (a leading dash can be
+  parsed as an option flag); Part 0 begins with `# ` to sidestep this — keep
+  the first character `#` or a letter.
+- **Part 1 — task-fields block.** Title, description (fenced, treated as data),
+  acceptance criteria, plan, plus the unit name (`coord-<short-id>`).
+- **Part 2 — workflow body.** The verbatim body of the selected workflow
+  version (materialized cache `.orchestration/workflows/<slug>.md`, REST
+  fallback), with `{{ }}` tokens substituted. The workflow body is the complete
+  phase list — the orchestrator does not inline phase instructions.
+- **Part 3 — mandatory release checklist trailer.** Orchestrator-injected,
+  identical across workflows: commit-attribution discipline, `attrs.completion`
+  PATCH, and an **MCP-first** `release_task` (curl fallback). Terminal
+  `task.status` + `attrs.completion` is the ship signal REAP keys off — there is
+  no `RELEASED` stdout marker. Specified exactly once in `orch-start.md` §6d
   Part 3 — do not replicate the snippet elsewhere.
 
 ### 5a. Workflow selection
@@ -705,12 +742,12 @@ not loop further; iterating to convergence is the owner's call.
 
 ### Peak parallelism
 
-At peak: 10 coordinator children × up to 3 parallel BUILD specialists
-per coordinator = **up to 30 concurrent `claude -p` processes** across
-all teammates. Supported by the Teams + `SendMessage` delegation model
-(each pane is an independent OS process). The orchestrator session
-itself does not hold these as Agent children — each coordinator is
-an independent `claude -p` process.
+At peak: up to `ORCH_MAX_IN_FLIGHT` (10) coordinator units × up to 3 parallel
+BUILD specialist subagents each. Each coordinator runs as a background agent and
+fans out to typed specialist subagents via the `Agent` tool; the in-flight cap
+is `ORCH_MAX_IN_FLIGHT`, while the concurrent-subagent count inside one
+coordinator's Workflow is a separate, lower runtime limit. There are no tmux
+panes and no `claude -p` processes — fan-out is native.
 
 ---
 
@@ -866,7 +903,7 @@ Parsed against a fixed allow-list on every tick. Everything else → menu reply.
 | `merge <short-id>` | **Manual override** — use when auto-merge was disabled (e.g., after a `hold`): `gh pr merge <url> --squash --delete-branch` on task-branch PR |
 | `hold <short-id>` | Cancel auto-merge for this PR (`gh pr merge --disable-auto <url>`); owner must send `merge <short-id>` to merge manually later |
 | `close <short-id>` | `gh pr close <url>` + note |
-| `unblock <short-id>: <text>` | Note with owner text; `blocked` → `in_progress`. Next tick treats the task as fresh (no `_coordinator_task_id`) and re-delegates via top-up |
+| `unblock <short-id>: <text>` | Note with owner text; `blocked` → `in_progress`. Next tick treats the task as fresh (no `_dispatch_ref`) and re-delegates via top-up |
 | `deploy-dev-to-main` | Open `main ← dev` PR; on subsequent `merge` reply, `gh pr merge --merge` **without** `--delete-branch` |
 | `deploy` / `deploy-prod` | Run repo's deploy script; report result |
 
@@ -991,17 +1028,14 @@ pursued:
 - **Bidirectional review iteration.** v2 caps the fix-up at one round
   per coordinator. A future version might allow the coordinator to
   escalate "review is looping" back to the owner as a blocker.
-- ~~**Early-wake on background completion.** v2 waits up to 20 min for
-  the next scheduled tick to run the ship path after a coordinator
-  releases. A callback-triggered `ScheduleWakeup(60s)` could shave
-  latency.~~ **Shipped**: `/orch-start` preflight arms a persistent
-  Monitor watching `/tmp/coord-*.done`. When a coordinator finishes, the
-  Monitor emits `COORD_DONE <short-id> exit=<n> last="..."` which fires
-  an out-of-band tick that runs REAP on just that task (no
-  ScheduleWakeup reschedule — the existing 20-min tick still fires for
-  heartbeat/top-up). Coordinator/specialist launches now use
-  `script -qefc '<cmd>' <log>` to preserve line-buffered pty output so
-  teammate output streams live — see `docs/teams-delegation.md`.
+- ~~**Early-wake on background completion.** v1 waited up to 20 min for
+  the next scheduled tick to run the ship path after a unit released.~~
+  **Shipped (v7):** a background agent's **native completion notification**
+  fires an out-of-band REAP on just that task (branch on terminal
+  `task.status`; no `ScheduleWakeup` reschedule — the existing 20-min tick
+  still fires for heartbeat/top-up). This replaces the retired
+  `/tmp/coord-*.done` Monitor + `script -qefc` pty-scraping scheme; native
+  units surface completion through the harness, not through log files.
 
 - ~~**Coord deaths become invisible.** Quota-kill, OOM, or network loss
   caused coord processes to die silently; the orchestrator had no path
@@ -1030,8 +1064,8 @@ state model (no fresh-session bootstrap). Cron variant is planned (§13).
 Taskforge leases are atomic. The second orchestrator's `claim_task`
 will fail (or no-op) because the first already holds the lease. Both
 will see the same `list_tasks` result, but only one will win the claim
-per task. `_coordinator_task_id` is session-scoped so each session
-only reaps its own background children. Non-issue in practice, but
+per task. `_dispatch_ref` names a unit this session dispatched, so each
+session only reaps its own background units. Non-issue in practice, but
 don't do it on purpose.
 
 **Q: Can the orchestrator process tasks outside `agile_tracker`?**

@@ -114,3 +114,74 @@ def test_part0_team_lead_context():
 
 def test_part0_checkpoint_discipline_retained():
     assert "checkpoint_phase.py" in _part0()
+
+
+# --- v2 (orch-v2-rebaseline) native-dispatch assertions ---
+
+def test_part0_mentions_workflow_tool():
+    # Non-trivial units drive phases with the native Workflow tool.
+    assert "Workflow" in _part0()
+
+
+def test_part0_uses_agent_tool_for_fanout():
+    assert "Agent" in _part0()
+
+
+def test_part0_no_done_file_polling():
+    # v2 reaps off durable Taskforge state, not a .done marker.
+    assert ".done" not in _part0()
+
+
+def test_part1_uses_unit_name_label(base_task):
+    # "Team name:" was the Teams-era label; v2 uses a neutral unit name.
+    p1 = bcp.part1(base_task, worktree="/tmp/test", branch="b", window="coord-aaaaaaaa")
+    assert "Unit name:" in p1
+    assert "Team name:" not in p1
+
+
+# --- Full assembled-prompt native-model invariants ---
+# The whole unit prompt (Part 0 + task fields + workflow body + release trailer)
+# must instruct the coordinator to dispatch natively and must carry no live
+# instruction to use the retired tmux / `claude -p` / Teams mechanisms.
+
+# Retired execution primitives — none may appear anywhere in the assembled
+# prompt, in either an instruction OR an explanatory aside. build-coord-prompt.py
+# is expected to keep the prompt free of the tokens entirely (negative framing
+# belongs in the design docs, not in the dispatched unit's prompt).
+_RETIRED_TOKENS = (
+    "tmux",
+    "pane",
+    "claude -p",
+    "TeamCreate",
+    "TeamDelete",
+    "coordinator team",
+    "teammate",
+    ".done",
+    "RELEASED",
+)
+
+
+def test_assembled_prompt_has_no_retired_tokens(base_task):
+    prompt = _build(base_task)
+    for token in _RETIRED_TOKENS:
+        assert token not in prompt, (
+            f"assembled unit prompt must not contain retired token {token!r}"
+        )
+
+
+def test_assembled_prompt_resume_has_no_retired_tokens(task_with_checkpoint):
+    prompt = _build(task_with_checkpoint, resume=True)
+    for token in _RETIRED_TOKENS:
+        assert token not in prompt, (
+            f"resumed unit prompt must not contain retired token {token!r}"
+        )
+
+
+def test_assembled_prompt_asserts_native_dispatch(base_task):
+    prompt = _build(base_task)
+    # Fan-out is via the Agent tool; multi-phase pipelines via the Workflow tool.
+    assert "Agent" in prompt
+    assert "Workflow" in prompt
+    # Durable hand-back: commit + attrs.completion + release_task (no stdout marker).
+    assert "attrs.completion" in prompt or "`attrs.completion`" in prompt
+    assert "release_task" in prompt
